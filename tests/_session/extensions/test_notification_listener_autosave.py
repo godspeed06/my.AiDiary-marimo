@@ -18,6 +18,7 @@ from marimo._messaging.notebook.changes import (
     SetConfig,
     SetName,
     Transaction,
+    TransactionSource,
 )
 from marimo._messaging.notebook.document import NotebookCell, NotebookDocument
 from marimo._messaging.notification import (
@@ -26,6 +27,7 @@ from marimo._messaging.notification import (
 )
 from marimo._messaging.serde import serialize_kernel_message
 from marimo._messaging.types import KernelMessage
+from marimo._server.models.models import SaveNotebookRequest
 from marimo._session.extensions.extensions import (
     NotificationListenerExtension,
 )
@@ -70,7 +72,7 @@ def _document_from(app_file_manager: AppFileManager) -> NotebookDocument:
 
 
 def _serialize_tx(
-    *changes: DocumentChange, source: str = "kernel"
+    *changes: DocumentChange, source: TransactionSource = "code-mode"
 ) -> KernelMessage:
     return serialize_kernel_message(
         NotebookDocumentTransactionNotification(
@@ -430,9 +432,9 @@ class TestCellSnapshotIsolation:
         received: list[list[NotebookCell]] = []
         real_save = session.app_file_manager.save_from_cells
 
-        def _capture(cells: list[NotebookCell]) -> str:
+        def _capture(cells: list[NotebookCell], **kwargs: object) -> str:
             received.append(list(cells))
-            return real_save(cells)
+            return real_save(cells, **kwargs)
 
         session.app_file_manager.save_from_cells = _capture  # type: ignore[method-assign]
 
@@ -470,9 +472,9 @@ class TestCellSnapshotIsolation:
         received: list[list[NotebookCell]] = []
         real_save = session.app_file_manager.save_from_cells
 
-        def _capture(cells: list[NotebookCell]) -> str:
+        def _capture(cells: list[NotebookCell], **kwargs: object) -> str:
             received.append(list(cells))
-            return real_save(cells)
+            return real_save(cells, **kwargs)
 
         session.app_file_manager.save_from_cells = _capture  # type: ignore[method-assign]
 
@@ -514,3 +516,51 @@ class TestLayoutPreservation:
             app_file_manager.app.config.layout_file
             == "layouts/with_layout.grid.json"
         )
+
+
+class TestAutosaveOrdering:
+    """Queued autosaves must not clobber newer foreground save state."""
+
+    def test_stale_autosave_does_not_clobber_newer_rename_and_save(
+        self,
+        ext: NotificationListenerExtension,
+        session: Mock,
+        app_file_manager: AppFileManager,
+        existing_cell_id: CellId_t,
+        notebook_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queued_work: list[tuple[object, object | None]] = []
+
+        def _capture_submit(
+            work: object, *, on_error: object | None = None
+        ) -> None:
+            queued_work.append((work, on_error))
+
+        monkeypatch.setattr(ext._autosave_runner, "submit", _capture_submit)
+
+        ext._on_kernel_message(
+            session,
+            _serialize_tx(SetCode(cell_id=existing_cell_id, code="old = 1")),
+        )
+        assert len(queued_work) == 1
+
+        renamed_path = notebook_path.with_name("renamed_after_autosave.py")
+        app_file_manager.rename(str(renamed_path))
+        app_file_manager.save(
+            SaveNotebookRequest(
+                cell_ids=[existing_cell_id],
+                filename=str(renamed_path),
+                codes=["new = 2"],
+                names=[""],
+                configs=[CellConfig()],
+            )
+        )
+
+        work, _on_error = queued_work.pop()
+        assert callable(work)
+        work()
+
+        contents = renamed_path.read_text()
+        assert "new = 2" in contents
+        assert "old = 1" not in contents

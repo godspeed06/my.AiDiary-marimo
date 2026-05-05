@@ -25,7 +25,7 @@ from typing import (
 from uuid import uuid4
 
 from marimo import _loggers
-from marimo._ast.cell import CellConfig, CellImpl
+from marimo._ast.cell import CellConfig, CellImpl, RuntimeStateType
 from marimo._ast.compiler import _build_source_position_map, compile_cell
 from marimo._ast.errors import ImportStarError
 from marimo._ast.names import SETUP_CELL_NAME
@@ -182,6 +182,9 @@ from marimo._runtime.packages.utils import (
     is_python_isolated,
 )
 from marimo._runtime.params import CLIArgs, QueryParams
+from marimo._runtime.parent_poller import (
+    start_parent_poller,
+)
 from marimo._runtime.redirect_streams import redirect_streams
 from marimo._runtime.reload.autoreload import ModuleReloader
 from marimo._runtime.reload.module_watcher import ModuleWatcher
@@ -1401,12 +1404,39 @@ class Kernel:
             # common cases. We could also be more aggressive and run this before
             # every cell, or even before pickle.dump/pickle.dumps()
             with patches.patch_main_module_context(self._module):
+                # Snapshot disabled cells that are in an error/cancelled state
+                # BEFORE running, so we can clear them after the run if their
+                # ancestor recovered.
+                pre_run_errored_disabled = {
+                    cid
+                    for cid, cell in self.graph.cells.items()
+                    if self.graph.is_disabled(cid)
+                    and cell.run_result_status
+                    in ("exception", "marimo-error", "cancelled")
+                }
                 while cell_ids := await self._run_cells_internal(cell_ids):
                     LOGGER.debug("Running state updates ...")
                     if self.lazy() and cell_ids:
                         self.graph.set_stale(cell_ids, prune_imports=True)
                         break
                 LOGGER.debug("Finished run.")
+                # Clear stale error state from disabled cells whose ancestor
+                # recovered. Uses pre-run snapshot since run_result_status is
+                # updated during the run.
+                for cid in pre_run_errored_disabled:
+                    cell_impl = self.graph.cells[cid]
+                    if not self.graph.is_any_ancestor_errored(cid):
+                        cell_impl.set_run_result_status("disabled")
+                        status = cast(
+                            RuntimeStateType,
+                            "idle"
+                            if cell_impl.config.disabled
+                            else "disabled-transitively",
+                        )
+                        cell_impl.set_runtime_state(status)
+                        CellNotificationUtils.broadcast_empty_output(
+                            cell_id=cid, status=status
+                        )
 
     async def _if_autorun_then_run_cells(
         self, cell_ids: set[CellId_t]
@@ -1814,6 +1844,7 @@ class Kernel:
                 relatives=dataflow.get_import_block_relatives(self.graph),
             )
         )
+
         if self.module_watcher is not None:
             self.module_watcher.run_is_processed.set()
 
@@ -1848,11 +1879,28 @@ class Kernel:
 
     @kernel_tracer.start_as_current_span("set_ui_element_value")
     async def set_ui_element_value(
-        self, request: UpdateUIElementCommand
+        self,
+        request: UpdateUIElementCommand,
+        *,
+        notify_frontend: bool,
     ) -> bool:
         """Set the value of a UI element bound to a global variable.
 
         Runs cells that reference the UI element by name.
+
+        Args:
+            request: The UI element update command.
+            notify_frontend: Whether to broadcast the new value back to
+                the frontend via a ``marimo-ui-value-update`` message.
+                Set ``False`` for user-initiated updates from the frontend
+                (the frontend already has the value locally;
+                re-broadcasting causes redundant traffic and, on transports
+                with non-negligible round-trip latency (LSP, remote
+                kernels), can visibly snap the rendered widget backward to
+                a stale value). Set ``True`` for genuinely
+                kernel-initiated changes (e.g. code_mode's
+                ``set_ui_value``) where the frontend has no other way to
+                learn about the update.
 
         Returns True if any ui elements were set, False otherwise
         """
@@ -1881,7 +1929,8 @@ class Kernel:
                                 object_ids=[object_id],
                                 values=[value],
                                 request=request.request,
-                            )
+                            ),
+                            notify_frontend=notify_frontend,
                         )
                     ):
                         bindings = [
@@ -1953,19 +2002,17 @@ class Kernel:
                     write_traceback(tmpio.read())
                 else:
                     updated_components.append(component)
-                    # Broadcast the new value to the frontend so the
-                    # rendered widget reflects kernel-initiated changes
-                    # (e.g. from code_mode's set_ui_value).
-                    broadcast_notification(
-                        UIElementMessageNotification(
-                            ui_element=object_id,
-                            message={
-                                "type": "marimo-ui-value-update",
-                                "value": value,
-                            },
-                        ),
-                        self.stream,
-                    )
+                    if notify_frontend:
+                        broadcast_notification(
+                            UIElementMessageNotification(
+                                ui_element=object_id,
+                                message={
+                                    "type": "marimo-ui-value-update",
+                                    "value": value,
+                                },
+                            ),
+                            self.stream,
+                        )
 
             bound_names = {
                 name
@@ -2338,7 +2385,7 @@ class Kernel:
             request: UpdateUIElementCommand,
         ) -> None:
             with http_request_context(request.request):
-                await self.set_ui_element_value(request)
+                await self.set_ui_element_value(request, notify_frontend=False)
             broadcast_notification(CompletedRunNotification())
 
         async def handle_pdb_request(request: DebugCellCommand) -> None:
@@ -2363,7 +2410,8 @@ class Kernel:
                 await self.set_ui_element_value(
                     UpdateUIElementCommand.from_ids_and_values(
                         [(UIElementId(ui_element_id), state)]
-                    )
+                    ),
+                    notify_frontend=False,
                 )
                 broadcast_notification(CompletedRunNotification())
             elif self.state_updates:
@@ -3509,21 +3557,25 @@ def launch_kernel(
     profile_path: str | None = None,
     log_level: int | None = None,
     is_ipc: bool = False,
+    parent_pid: int | None = None,
 ) -> None:
     if log_level is not None:
         _loggers.set_level(log_level)
     LOGGER.debug("Launching kernel")
 
-    # Determine behavior:
-    # - is_subprocess: edit mode uses Process, IPC uses subprocess - both can receive signals
-    # - Run mode (not edit) uses autorun config regardless of IPC
     is_subprocess = is_edit_mode or is_ipc
-
     loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None
     if is_subprocess:
         restore_signals()
 
-        # The runtime process inherits the server's loop policy, on Windows, we
+        # Become the leader of a new session/process group before connecting
+        # back to the parent, to avoid race conditions with the parent
+        # process (which assumes its child is in another process group).
+        if sys.platform != "win32":
+            os.setsid()
+            start_parent_poller(parent_pid)
+
+        # The runtime process inherits the server's loop policy. On Windows, we
         # restore the event loop policy to the default ProactorEventLoop, so
         # user code can use asyncio.create_subprocess_exec and other APIs that
         # the SelectorEventLoop does not implement.
@@ -3553,18 +3605,30 @@ def launch_kernel(
     pipe: TypedConnection[KernelMessage] | None = None
     if socket_addr is not None:
         n_tries = 0
+        last_error: BaseException | None = None
         while n_tries < 100:
             try:
                 pipe = TypedConnection[KernelMessage].of(
                     connection.Client(socket_addr)
                 )
                 break
-            except Exception:
+            except Exception as e:
+                last_error = e
                 n_tries += 1
                 time.sleep(0.01)
 
         if n_tries == 100 or pipe is None:
-            LOGGER.debug("Failed to connect to socket.")
+            # The parent may still be waiting for this subprocess to connect,
+            # but startup now watches kernel liveness and will abort if the
+            # kernel exits. Log the cause so the failure is diagnosable
+            # instead of opaque.
+            LOGGER.error(
+                "marimo kernel subprocess failed to connect to %s "
+                "after %d attempts",
+                socket_addr,
+                n_tries,
+                exc_info=last_error,
+            )
             return
 
         stream = ThreadSafeStream(
@@ -3663,17 +3727,10 @@ def launch_kernel(
         # Subprocess kernels (EDIT and IPC_RUN) can receive signals and need
         # their own formatter registration since they don't share state with
         # the host process.
+        #
+        # Each subprocess kernel needs to install the formatter import hooks
         from marimo._output.formatters.formatters import register_formatters
 
-        # TODO: Windows workaround -- find a way to make the process
-        # its group leader
-        if sys.platform != "win32":
-            # Make this process group leader to prevent it from receiving
-            # signals intended for the parent (server) process,
-            # Ctrl+C in particular.
-            os.setsid()
-
-        # Each subprocess kernel needs to install the formatter import hooks
         register_formatters(theme=user_config["display"]["theme"])
 
         signal.signal(signal.SIGINT, handlers.construct_interrupt_handler(ctx))

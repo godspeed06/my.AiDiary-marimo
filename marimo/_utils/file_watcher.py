@@ -68,10 +68,12 @@ class PollingFileWatcher(FileWatcher):
         self.loop = loop
         self.last_modified: float | None = self._get_modified()
         self._missing_count = 0
+        self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         self._running = True
-        self.loop.create_task(self._poll())
+        # Hold a strong reference so the task isn't GC'd mid-poll.
+        self._task = self.loop.create_task(self._poll())
 
     def stop(self) -> None:
         self._running = False
@@ -106,13 +108,18 @@ class PollingFileWatcher(FileWatcher):
             # File exists again; reset the missing counter
             self._missing_count = 0
 
-            # Check for file changes
+            # Check for file changes. Note: the file may be removed between
+            # the exists() check above and the _get_modified() call here
+            # (common on Windows, where deletion is asynchronous). In that
+            # case _get_modified() returns None; skip this cycle so we don't
+            # fire a spurious callback.
             modified = self._get_modified()
-            if self.last_modified is None:
-                self.last_modified = modified
-            elif modified != self.last_modified:
-                self.last_modified = modified
-                await self.on_file_changed()
+            if modified is not None:
+                if self.last_modified is None:
+                    self.last_modified = modified
+                elif modified != self.last_modified:
+                    self.last_modified = modified
+                    await self.on_file_changed()
             await asyncio.sleep(self.POLL_SECONDS)
 
 

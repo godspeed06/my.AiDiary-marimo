@@ -31,15 +31,15 @@ from marimo._output.hypertext import patch_html_for_non_interactive_output
 from marimo._runtime.commands import AppMetadata, SerializedCLIArgs
 from marimo._runtime.patches import extract_docstring_from_header
 from marimo._schemas.serialization import NotebookSerialization
+from marimo._server.export._status import emit_pdf_export_status
 from marimo._server.export.exporter import Exporter
-from marimo._server.file_router import AppFileRouter
 from marimo._server.models.export import (
     ExportAsHTMLRequest,
     ExportPDFPreset,
 )
 from marimo._server.models.models import InstantiateNotebookRequest
 from marimo._session.model import ConnectionState, SessionMode
-from marimo._session.notebook import AppFileManager
+from marimo._session.notebook import AppFileManager, load_notebook
 from marimo._types.ids import ConsumerId
 from marimo._utils.marimo_path import MarimoPath
 
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from marimo._server.export._pdf_raster import PDFRasterizationOptions
+    from marimo._server.export._status import PDFExportStatusCallback
     from marimo._session.state.session_view import SessionView
     from marimo._session.types import Session
     from marimo._types.ids import CellId_t
@@ -183,11 +184,7 @@ def export_as_wasm(
 def notebook_uses_slides_layout(filepath: MarimoPath) -> bool:
     """Return whether a notebook declares the slides layout."""
     try:
-        file_router = AppFileRouter.from_filename(filepath)
-        file_key = file_router.get_unique_file_key()
-        if file_key is None:
-            return False
-        file_manager = file_router.get_file_manager(file_key)
+        file_manager = load_notebook(filepath.absolute_name)
         layout_config = file_manager.read_layout_config()
         return layout_config is not None and layout_config.type == "slides"
     except Exception as e:
@@ -205,10 +202,7 @@ async def run_app_then_export_as_ipynb(
     cli_args: SerializedCLIArgs,
     argv: list[str] | None,
 ) -> ExportResult:
-    file_router = AppFileRouter.from_filename(filepath)
-    file_key = file_router.get_unique_file_key()
-    assert file_key is not None
-    file_manager = file_router.get_file_manager(file_key)
+    file_manager = load_notebook(filepath.absolute_name)
 
     with patch_html_for_non_interactive_output():
         # Use quiet=True to suppress runtime stdout/stderr since outputs
@@ -242,17 +236,20 @@ async def run_app_then_export_as_pdf(
     export_as: ExportPDFPreset | None,
     include_inputs: bool = True,
     rasterization_options: PDFRasterizationOptions | None = None,
+    status_callback: PDFExportStatusCallback | None = None,
 ) -> tuple[bytes | None, bool]:
-    file_router = AppFileRouter.from_filename(filepath)
-    file_key = file_router.get_unique_file_key()
-    assert file_key is not None
-    file_manager = file_router.get_file_manager(file_key)
+    file_manager = load_notebook(filepath.absolute_name)
 
     session_view: SessionView | None = None
     png_fallbacks: Mapping[CellId_t, str] | None = None
     did_error = False
 
     if include_outputs:
+        emit_pdf_export_status(
+            status_callback,
+            phase="execute",
+            message="executing notebook...",
+        )
         with patch_html_for_non_interactive_output():
             # Using quiet=True to suppress runtime stdout/stderr since outputs
             # are captured in the session_view and will be included in the PDF
@@ -262,6 +259,11 @@ async def run_app_then_export_as_pdf(
                 argv,
                 quiet=True,
             )
+        emit_pdf_export_status(
+            status_callback,
+            phase="execute_complete",
+            message="notebook execution finished.",
+        )
 
         if (
             session_view is not None
@@ -279,7 +281,13 @@ async def run_app_then_export_as_pdf(
                 filepath=filepath.absolute_name,
                 argv=argv,
                 options=rasterization_options,
+                status_callback=status_callback,
             )
+    emit_pdf_export_status(
+        status_callback,
+        phase="prepare",
+        message="serializing notebook for PDF rendering...",
+    )
     exporter = Exporter()
     if export_as == "slides":
         pdf_data = await exporter.export_as_slides_pdf(
@@ -287,6 +295,7 @@ async def run_app_then_export_as_pdf(
             session_view=session_view,
             png_fallbacks=png_fallbacks,
             include_inputs=include_inputs,
+            status_callback=status_callback,
         )
     else:
         pdf_data = exporter.export_as_pdf(
@@ -295,6 +304,13 @@ async def run_app_then_export_as_pdf(
             png_fallbacks=png_fallbacks,
             include_inputs=include_inputs,
             webpdf=webpdf,
+            status_callback=status_callback,
+        )
+    if pdf_data is not None:
+        emit_pdf_export_status(
+            status_callback,
+            phase="complete",
+            message="done.",
         )
     return pdf_data, did_error
 
@@ -307,11 +323,7 @@ async def run_app_then_export_as_html(
     *,
     asset_url: str | None = None,
 ) -> ExportResult:
-    # Create a file router and file manager
-    file_router = AppFileRouter.from_filename(path)
-    file_key = file_router.get_unique_file_key()
-    assert file_key is not None
-    file_manager = file_router.get_file_manager(file_key)
+    file_manager = load_notebook(path.absolute_name)
 
     # Inline the layout file, if it exists
     file_manager.app.inline_layout_file()
@@ -352,14 +364,7 @@ async def export_as_html_without_execution(
     """Export a notebook to HTML without executing its cells."""
     from marimo._session.state.session_view import SessionView
 
-    file_router = AppFileRouter.from_filename(path)
-    file_key = file_router.get_unique_file_key()
-    if file_key is None:
-        raise RuntimeError(
-            "Expected a unique file key when exporting a single notebook: "
-            f"{path.absolute_name}"
-        )
-    file_manager = file_router.get_file_manager(file_key)
+    file_manager = load_notebook(path.absolute_name)
 
     # Inline the layout file, if it exists.
     file_manager.app.inline_layout_file()

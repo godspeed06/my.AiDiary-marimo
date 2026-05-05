@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import threading
 from typing import TYPE_CHECKING, cast
+from urllib.parse import urlparse
 
 import uvicorn
 
@@ -17,6 +17,7 @@ from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._mcp.setup import McpType, setup_mcp_server
 from marimo._messaging.notification import StartupLogsNotification
 from marimo._runtime.commands import SerializedCLIArgs
+from marimo._runtime.parent_poller import start_parent_poller
 from marimo._server.api import lifespans
 from marimo._server.config import (
     StarletteServerStateInit,
@@ -44,7 +45,6 @@ if TYPE_CHECKING:
     from marimo._cli.tips import CliTip
 
 DEFAULT_PORT = 2718
-PROXY_REGEX = re.compile(r"^(.*):(\d+)$")
 
 
 def _execute_startup_command(
@@ -140,21 +140,49 @@ def _resolve_proxy(port: int, host: str, proxy: str | None) -> tuple[int, str]:
        (uvicorn)  -----------------
 
 
-    If the proxy is provided, it will default to port 80. Otherwise if the
-    proxy has a port specified, it will use that port.
-    e.g. `example.com:8080`
+    If the proxy is provided, it will default to port 80 (443 for https://).
+    Supports bare hostnames, host:port, and full URLs with a scheme.
+    e.g. `example.com:8080`, `https://example.com`, `https://example.com:8443`
     """
     if not proxy:
         return port, host
 
-    match = PROXY_REGEX.match(proxy)
-    # Our proxy has an explicit port defined, so return that.
-    if match:
-        external_host, external_port = match.groups()
-        return int(external_port), external_host
+    # Prefix with "//" so urlparse treats the value as a netloc rather than a
+    # path when no scheme is present — handles "host", "host:port", and full
+    # "scheme://host:port" forms uniformly.
+    parse_target = proxy if "://" in proxy else f"//{proxy}"
 
-    # A default to 80 is reasonable if a proxy is provided.
-    return 80, proxy
+    try:
+        parsed = urlparse(parse_target)
+
+        # parsed.hostname strips brackets from IPv6 addresses
+        # (e.g. [::1] → ::1)
+        external_host = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError:
+        LOGGER.warning(
+            "Ignoring invalid proxy value %r; falling back to host=%r, port=%r",
+            proxy,
+            host,
+            port,
+        )
+        return port, host
+
+    # Bare-port inputs like ":8080" leave parsed.hostname empty (urlparse
+    # sees an empty netloc with an explicit port); fall back to the
+    # original `host` arg rather than using the literal proxy string —
+    # which otherwise becomes the nonsense public hostname ":8080".
+    if not external_host:
+        external_host = host
+
+    if parsed_port is not None:
+        external_port = parsed_port
+    elif parsed.scheme == "https":
+        external_port = 443
+    else:
+        external_port = 80
+
+    return external_port, external_host
 
 
 def start(
@@ -191,6 +219,20 @@ def start(
     Start the server.
     """
     import packaging.version
+
+    # In single-file sandbox mode, uv becomes our direct parent. So we
+    # watch the outer CLI's PID, terminating if the CLI terminates.
+    ancestor_pid_env = os.environ.get("MARIMO_ANCESTOR_PID")
+    if ancestor_pid_env:
+        try:
+            start_parent_poller(
+                parent_pid=os.getppid(),
+                ancestor_pid=int(ancestor_pid_env),
+            )
+        except ValueError:
+            LOGGER.warning(
+                "Ignoring invalid MARIMO_ANCESTOR_PID=%r", ancestor_pid_env
+            )
 
     # Defaults when mcp is enabled
     if mcp:
@@ -293,6 +335,7 @@ def start(
         lifespans.open_browser,
         lifespans.tool_manager,
         lifespans.server_registry,
+        lifespans.reap_subprocesses,
         *LIFESPAN_REGISTRY.get_all(),
     ]
 

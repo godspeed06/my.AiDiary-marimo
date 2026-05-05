@@ -1261,6 +1261,16 @@ def test_show_download(df: Any) -> None:
 
 DOWNLOAD_FORMATS = ["csv", "json", "parquet"]
 
+# Parquet export requires pandas+pyarrow or polars (see the `_download_as`
+# short-circuit in `table.py`). In environments without those — e.g. the
+# `test` group, which has only pyarrow — skip parquet in the round-trip.
+_CAN_EXPORT_PARQUET = DependencyManager.polars.has() or (
+    DependencyManager.pandas.has() and DependencyManager.pyarrow.has()
+)
+_TESTABLE_DOWNLOAD_FORMATS = (
+    DOWNLOAD_FORMATS if _CAN_EXPORT_PARQUET else ["csv", "json"]
+)
+
 
 @pytest.mark.parametrize(
     "df",
@@ -1335,7 +1345,7 @@ def test_download_as(df: Any) -> None:
         raise ValueError(f"Unsupported format: {format_type}")
 
     # Test base downloads (full data)
-    for format_type in DOWNLOAD_FORMATS:
+    for format_type in _TESTABLE_DOWNLOAD_FORMATS:
         downloaded_df = download_and_convert(format_type, table)
         downloaded_nw = nw.from_native(downloaded_df)
         assert len(downloaded_nw) == len(nw_df)
@@ -1343,7 +1353,7 @@ def test_download_as(df: Any) -> None:
 
     # Test downloads with search filter
     table._search(SearchTableArgs(query="New", page_size=10, page_number=0))
-    for format_type in DOWNLOAD_FORMATS:
+    for format_type in _TESTABLE_DOWNLOAD_FORMATS:
         filtered_df = download_and_convert(format_type, table)
         filtered_nw = nw.from_native(filtered_df)
         assert len(filtered_nw) == 2
@@ -1352,7 +1362,7 @@ def test_download_as(df: Any) -> None:
 
     # Test downloads with row selection (includes search from before)
     table._convert_value(["1"])  # select one row of the filtered view
-    for format_type in DOWNLOAD_FORMATS:
+    for format_type in _TESTABLE_DOWNLOAD_FORMATS:
         selected_df = download_and_convert(format_type, table)
         selected_nw = nw.from_native(selected_df)
         # For row selection, selection is respected (single row)
@@ -1374,6 +1384,40 @@ def test_download_as_ignores_cell_selection() -> None:
     assert isinstance(rows, list)
     assert len(rows) == 1
     assert int(rows[0]["a"]) == 2
+
+
+def test_download_as_parquet_without_libs_reports_missing_packages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(DependencyManager.pandas, "has", lambda: False)
+    monkeypatch.setattr(DependencyManager.polars, "has", lambda: False)
+    monkeypatch.setattr(DependencyManager.pyarrow, "has", lambda: False)
+
+    table = ui.table([{"a": 1}])
+    response = table._download_as(DownloadAsArgs(format="parquet"))
+
+    assert response.url == ""
+    assert response.filename == ""
+    assert response.missing_packages == ["polars"]
+    assert response.error is not None
+    assert "polars" in response.error
+
+
+def test_download_as_parquet_with_pandas_only_prompts_pyarrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(DependencyManager.pandas, "has", lambda: True)
+    monkeypatch.setattr(DependencyManager.polars, "has", lambda: False)
+    monkeypatch.setattr(DependencyManager.pyarrow, "has", lambda: False)
+
+    table = ui.table([{"a": 1}])
+    response = table._download_as(DownloadAsArgs(format="parquet"))
+
+    assert response.url == ""
+    assert response.filename == ""
+    assert response.missing_packages == ["pyarrow"]
+    assert response.error is not None
+    assert "pyarrow" in response.error
 
 
 @pytest.mark.skipif(
@@ -2193,10 +2237,14 @@ def test_lazy_dataframe_with_non_lazy_dataframe(df: Any):
 def test_get_data_url_no_deps() -> None:
     table = ui.table([1, 2, 3])
     response = table._get_data_url({})
-    assert response.data_url.startswith("data:application/json;base64,")
-    data = json.loads(from_data_uri(response.data_url)[1])
-    assert data == [{"value": 1}, {"value": 2}, {"value": 3}]
-    assert response.format == "json"
+    # DefaultTableManager.to_csv_str uses the stdlib csv module and works
+    # without pandas/polars/pyarrow, so _to_chart_data_url returns CSV before
+    # falling through to JSON.
+    assert response.data_url.startswith("data:text/csv;base64,")
+    assert from_data_uri(response.data_url)[1].decode("utf-8") == (
+        "value\n1\n2\n3\n"
+    )
+    assert response.format == "csv"
 
 
 @pytest.mark.skipif(
@@ -2223,7 +2271,7 @@ def test_get_data_url_values() -> None:
     from pandas.testing import assert_frame_equal
 
     df = _convert_data_bytes_to_pandas_df(response.data_url, response.format)
-    expected_df = pd.DataFrame({0: [1, 2, 3]})
+    expected_df = pd.DataFrame({"value": [1, 2, 3]})
     assert_frame_equal(df, expected_df)
 
     # Test search
@@ -2262,6 +2310,119 @@ def test_calculate_top_k_rows():
     )
     assert result == CalculateTopKRowsResponse(
         data=[(3, 2), (None, 2), (1, 1)],
+    )
+
+
+_TOP_K_DATA = {
+    "role": ["admin", "admin", "user", "user", "guest"],
+    "country": ["US", "UK", "US", "US", "UK"],
+}
+
+
+def _filter_role_in(values: list[str]) -> FilterGroup:
+    return FilterGroup(
+        type="group",
+        operator="and",
+        children=[
+            FilterCondition(
+                type="condition",
+                column_id="role",
+                operator="in",
+                value=values,
+            )
+        ],
+    )
+
+
+def _filter_country_eq(value: str) -> FilterGroup:
+    return FilterGroup(
+        type="group",
+        operator="and",
+        children=[
+            FilterCondition(
+                type="condition",
+                column_id="country",
+                operator="equals",
+                value=value,
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize("df", create_dataframes(_TOP_K_DATA))
+def test_top_k_ignores_same_column_filter(df: Any) -> None:
+    """Editing a filter on a column must not hide values the filter excludes."""
+    table = ui.table(df)
+    table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            filters=_filter_role_in(["admin", "user"]),
+        )
+    )
+    result = table._calculate_top_k_rows(
+        CalculateTopKRowsArgs(column="role", k=10)
+    )
+    # `guest` is excluded by the active filter but must still appear,
+    # otherwise users can't broaden the filter back out.
+    assert result == CalculateTopKRowsResponse(
+        data=[("admin", 2), ("user", 2), ("guest", 1)],
+    )
+
+
+@pytest.mark.parametrize("df", create_dataframes(_TOP_K_DATA))
+def test_top_k_respects_other_column_filter(df: Any) -> None:
+    table = ui.table(df)
+    table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            filters=_filter_country_eq("UK"),
+        )
+    )
+    result = table._calculate_top_k_rows(
+        CalculateTopKRowsArgs(column="role", k=10)
+    )
+    # Only UK rows survive: admin (UK) and guest (UK).
+    assert result == CalculateTopKRowsResponse(
+        data=[("admin", 1), ("guest", 1)],
+    )
+
+
+@pytest.mark.parametrize("df", create_dataframes(_TOP_K_DATA))
+def test_top_k_strips_self_filter_keeps_others(df: Any) -> None:
+    table = ui.table(df)
+    table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            filters=FilterGroup(
+                type="group",
+                operator="and",
+                children=[
+                    FilterCondition(
+                        type="condition",
+                        column_id="role",
+                        operator="in",
+                        value=["admin", "user"],
+                    ),
+                    FilterCondition(
+                        type="condition",
+                        column_id="country",
+                        operator="equals",
+                        value="UK",
+                    ),
+                ],
+            ),
+        )
+    )
+    result = table._calculate_top_k_rows(
+        CalculateTopKRowsArgs(column="role", k=10)
+    )
+    # `role` filter is stripped, `country == UK` still applies:
+    # UK rows are admin + guest. `guest` reappears because role filter is ignored.
+    assert result == CalculateTopKRowsResponse(
+        data=[("admin", 1), ("guest", 1)],
     )
 
 

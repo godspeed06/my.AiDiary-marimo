@@ -1,13 +1,17 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import functools
+import inspect
 import re
 import shutil
 import sys
 import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from unittest.mock import Mock, patch
 
 import pytest
 from _pytest import runner
@@ -50,6 +54,8 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from types import ModuleType
 
+    from typing_extensions import Self
+
 # register import hooks for third-party module formatters
 register_formatters()
 
@@ -86,13 +92,123 @@ def pytest_collection_modifyitems(
             item.add_marker(pytest.mark.skip(reason=reason))
 
 
+@pytest.fixture(scope="session")
+def _venv_canary_path() -> Path | None:
+    """Resolve an on-disk file whose existence signals the test venv is intact.
+
+    We use `hypothesis`: it's in the `test` dependency group but not in
+    `[project.dependencies]`, so if a test calls through to the real
+    `UvPackageManager.install`/`uninstall` (which shells out to
+    `uv add`/`uv remove` → `uv sync`), the sync resolves against
+    `[project.dependencies]` only and deletes every test-group package
+    from `.venv`. Watching `hypothesis/__init__.py` catches that
+    mutation with a single stat call.
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec("hypothesis")
+    if spec is None or spec.origin is None:
+        return None
+    path = Path(spec.origin)
+    return path if path.exists() else None
+
+
 @pytest.fixture(autouse=True)
-def _ensure_main_has_file() -> Generator[None, None, None]:
-    """Ensure __main__.__file__ is set for pytest-xdist workers.
+def _assert_venv_not_wiped(
+    _venv_canary_path: Path | None, request: pytest.FixtureRequest
+) -> Generator[None, None, None]:
+    """Fail fast if a test mutates the shared test venv.
+
+    The historical failure this guards against: an unmocked call to
+    `UvPackageManager.install`/`uninstall` (e.g. via
+    `ctx.packages.add`/`remove` in code-mode tests) runs
+    `uv add`/`uv remove` against the project's `pyproject.toml`,
+    then `uv sync` resolves only `[project.dependencies]` and deletes
+    every `[dependency-groups].test` package — pytest, hypothesis,
+    numpy, matplotlib, execnet, the `.venv/bin/pytest` shim — from the
+    venv. Subsequent tests cascade into obscure
+    `ModuleNotFoundError`/`FileNotFoundError` failures.
+
+    Checking the canary before and after each test pinpoints the exact
+    offender: see `tests/_code_mode/test_context.py::TestPackages` for
+    the required mocking pattern.
+
+    Under pytest-xdist, other workers run concurrently; the post-check
+    can fire on a worker whose current test did not cause the mutation.
+    We soften the post-check message in that case and recommend
+    rerunning with `-p no:xdist` to identify the culprit.
+    """
+    import os
+
+    under_xdist = "PYTEST_XDIST_WORKER" in os.environ
+
+    if _venv_canary_path is None:
+        # Could not establish a canary (e.g. hypothesis not installed on
+        # disk); nothing to protect.
+        yield
+        return
+
+    if not _venv_canary_path.exists():
+        pytest.fail(
+            f"Test venv was mutated before {request.node.nodeid!r}: "
+            f"canary {_venv_canary_path} is missing. A previous test "
+            f"invoked the real package manager (likely via "
+            f"ctx.packages.add/remove without mocking pm.install/"
+            f"pm.uninstall). See tests/_code_mode/test_context.py::"
+            f"TestPackages for the required pattern."
+        )
+    yield
+    if not _venv_canary_path.exists():
+        if under_xdist:
+            pytest.fail(
+                f"Test venv was mutated during or concurrent with "
+                f"{request.node.nodeid!r}: canary {_venv_canary_path} "
+                f"no longer exists. Under xdist the mutator may be a "
+                f"different worker's test. Rerun with `-p no:xdist` "
+                f"to identify the culprit. See "
+                f"tests/_code_mode/test_context.py::TestPackages for "
+                f"the required mocking pattern."
+            )
+        else:
+            pytest.fail(
+                f"Test {request.node.nodeid!r} mutated the shared venv: "
+                f"canary {_venv_canary_path} no longer exists. This test "
+                f"(or a fixture it uses) invoked the real package manager. "
+                f"Mock pm.install/pm.uninstall — see "
+                f"tests/_code_mode/test_context.py::TestPackages for the "
+                f"required pattern."
+            )
+
+
+@pytest.fixture(scope="session")
+def _fake_main_file(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A benign empty .py file to assign as __main__.__file__ in tests.
+
+    Why not reuse the real pytest launcher path? On Windows,
+    shutil.which("pytest") returns pytest.exe — a zipapp. If a cell
+    spawns a child process via multiprocessing.Manager() (or anything
+    using the "spawn" start method), the child runs
+    multiprocessing.spawn._fixup_main_from_path(__main__.__file__),
+    which calls runpy.run_path() on the parent's __file__. For a zipapp
+    pytest.exe that means pytest starts running inside the child
+    process, never writes the Manager's server address back, and the
+    parent hangs at reader.recv(). An empty .py file has no side
+    effects when runpy executes it.
+    """
+    path = tmp_path_factory.mktemp("marimo_test_main") / "pytest_main.py"
+    path.write_text("")
+    return path
+
+
+@pytest.fixture(autouse=True)
+def _ensure_main_has_file(
+    _fake_main_file: Path,
+) -> Generator[None, None, None]:
+    """Make sure main has a file ...
 
     xdist workers don't always set __file__ on __main__, which causes
-    marimo's kernel (create_main_module) to set __file__=None, breaking
-    tests that rely on __file__ being a real path.
+    marimo's kernel (create_main_module) to set __file__=None,
+    breaking tests that rely on __file__ being a real path.
     """
     main = sys.modules.get("__main__")
     if main is None:
@@ -103,16 +219,7 @@ def _ensure_main_has_file() -> Generator[None, None, None]:
     original_file = getattr(main, "__file__", None)
 
     if not had_file_attr or original_file is None:
-        # Find a valid pytest path: prefer shutil.which, fall back to
-        # sys.argv[0], then construct one from sys.executable.
-        pytest_path = shutil.which("pytest")
-        if pytest_path and Path(pytest_path).exists():
-            new_file = pytest_path
-        elif sys.argv and sys.argv[0] and Path(sys.argv[0]).exists():
-            new_file = sys.argv[0]
-        else:
-            new_file = str(Path(sys.executable).parent / "pytest")
-        main.__file__ = new_file
+        main.__file__ = str(_fake_main_file)
 
     try:
         yield
@@ -124,6 +231,26 @@ def _ensure_main_has_file() -> Generator[None, None, None]:
                 current_main.__file__ = original_file
             elif hasattr(current_main, "__file__"):
                 del current_main.__file__
+
+
+@pytest.fixture(autouse=True)
+def _save_and_restore_main(
+    _ensure_main_has_file: None,
+) -> Generator[None, None, None]:
+    """Restore sys.modules["__main__"] after each test.
+
+    marimo's kernel swaps out the main module via patch_main_module;
+    without this fixture, that swap leaks into subsequent tests.
+    """
+    main = sys.modules.get("__main__")
+    if main is None:
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        sys.modules["__main__"] = main
 
 
 @pytest.fixture(autouse=True)
@@ -421,6 +548,73 @@ class ExecReqProvider:
 @pytest.fixture
 def exec_req() -> ExecReqProvider:
     return ExecReqProvider()
+
+
+class MockPyodide:
+    """Simulate running in a Pyodide environment.
+
+    Patches ``sys.platform`` to ``"emscripten"`` so ``is_pyodide()`` returns
+    True, and stubs ``pyodide`` (plus any ``extra_modules``) in
+    ``sys.modules`` so ``import pyodide`` (and friends) succeeds.
+
+    Usable as a context manager or as a decorator on sync or async tests::
+
+        with mock_pyodide():
+            ...
+
+        @mock_pyodide()
+        async def test_foo(...): ...
+
+        @mock_pyodide(already_installed=Mock())
+        def test_bar(...): ...
+    """
+
+    def __init__(self, **extra_modules: Any) -> None:
+        self._extra_modules = extra_modules
+        self._stack: contextlib.ExitStack | None = None
+
+    def __enter__(self) -> Self:
+        modules = {"pyodide": Mock(), **self._extra_modules}
+        stack = contextlib.ExitStack()
+        stack.__enter__()
+        stack.enter_context(patch.object(sys, "platform", "emscripten"))
+        stack.enter_context(patch.dict(sys.modules, modules))
+        self._stack = stack
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        assert self._stack is not None
+        self._stack.__exit__(*exc)
+        self._stack = None
+
+    def __call__(self, func: Any) -> Any:
+        extra = self._extra_modules
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                with MockPyodide(**extra):
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(func)
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            with MockPyodide(**extra):
+                return func(*args, **kwargs)
+
+        return sync_wrapper
+
+
+# Lowercase alias for context-manager-style usage at call sites.
+mock_pyodide = MockPyodide
+
+
+@pytest.fixture
+def pyodide_env() -> Generator[None, None, None]:
+    """Pytest fixture that simulates running in a Pyodide environment."""
+    with mock_pyodide():
+        yield
 
 
 # Library fixtures for direct marimo integration with pytest.

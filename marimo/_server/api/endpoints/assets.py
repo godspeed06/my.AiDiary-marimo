@@ -5,8 +5,9 @@ import mimetypes
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
+from urllib.parse import urlencode
 
-from starlette.authentication import requires
+from starlette.authentication import has_required_scope, requires
 from starlette.exceptions import HTTPException
 from starlette.responses import (
     FileResponse,
@@ -21,6 +22,7 @@ from marimo import _loggers
 from marimo._cli.sandbox import SandboxMode
 from marimo._config.manager import get_default_config_manager
 from marimo._config.reader import find_nearest_pyproject_toml
+from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._output.utils import uri_decode_component, uri_encode_component
 from marimo._runtime.virtual_file import (
     EMPTY_VIRTUAL_FILE,
@@ -63,6 +65,18 @@ server_config = (
 
 assets_dir = root / "assets"
 follow_symlinks = server_config.get("follow_symlink", False)
+
+
+def _missing_index_html_detail() -> str:
+    repo_root = marimo_package_path().parent
+    if (repo_root / "frontend").exists() and (
+        repo_root / "pyproject.toml"
+    ).exists():
+        return (
+            "index.html not found. Did you run `make fe`? "
+            "Restart marimo after building."
+        )
+    return "index.html not found and no asset_url configured"
 
 
 def _has_symlinks(directory: Path) -> bool:
@@ -136,6 +150,29 @@ def _strip_access_token_redirect(request: Request) -> RedirectResponse:
         url=target,
         status_code=303,
         headers=_HTML_SECURITY_HEADERS,
+    )
+
+
+def _login_redirect(request: Request) -> RedirectResponse:
+    """Build a relative redirect to the login page for unauthenticated users.
+
+    Starlette's built-in `@requires(redirect=...)` builds the Location from
+    `request.url_for(...)` and embeds `str(request.url)` as `next=`. Both
+    of those use the request's `Host` header, so behind a reverse proxy
+    that doesn't rewrite `Host` the browser is sent to an internal
+    address. Emitting a relative `Location` sidesteps that — browsers
+    resolve it against the URL they themselves used, regardless of what
+    the proxy forwarded.
+
+    See https://github.com/marimo-team/marimo/issues/9249.
+    """
+    next_url = request.url.path
+    if request.url.query:
+        next_url = f"{next_url}?{request.url.query}"
+    login_path = request.app.url_path_for("auth:login_page")
+    return RedirectResponse(
+        url=f"{login_path}?{urlencode({'next': next_url})}",
+        status_code=303,
     )
 
 
@@ -256,8 +293,12 @@ async def _fetch_index_html_from_url(asset_url: str) -> str:
 
 
 @router.get("/")
-@requires("read", redirect="auth:login_page")
 async def index(request: Request) -> Response:
+    # Manual auth guard instead of `@requires(redirect=...)` so the
+    # Location is relative — see `_login_redirect` for the reasoning.
+    if not has_required_scope(request, ["read"]):
+        return _login_redirect(request)
+
     # Auth has already passed at this point — either via the session cookie
     # or by validating `access_token` in the query string (which also set
     # the cookie). If the token is still in the URL, redirect to strip it
@@ -287,7 +328,7 @@ async def index(request: Request) -> Response:
     else:
         raise HTTPException(
             status_code=500,
-            detail="index.html not found and no asset_url configured",
+            detail=_missing_index_html_detail(),
         )
 
     if not file_key:
@@ -457,7 +498,6 @@ STATIC_FILES = [
 
 
 @router.get("/@file/{filename_and_length:path}")
-@requires("read")
 def virtual_file(
     request: Request,
 ) -> Response:
@@ -481,6 +521,14 @@ def virtual_file(
         404:
             description: Invalid byte length in virtual file request
     """
+    # Auth is normally required via `@requires("read")`, but can be bypassed
+    # with the `_MARIMO_DISABLE_AUTH_ON_VIRTUAL_FILES` env var for
+    # sandboxed/embedded deployments where virtual file URLs must be
+    # fetched without session auth.
+    if not GLOBAL_SETTINGS.DISABLE_AUTH_ON_VIRTUAL_FILES:
+        if not has_required_scope(request, ["read"]):
+            raise HTTPException(status_code=403)
+
     filename_and_length = request.path_params["filename_and_length"]
 
     LOGGER.debug("Getting virtual file: %s", filename_and_length)
@@ -501,6 +549,17 @@ def virtual_file(
 
     chunks = read_virtual_file_chunked(filename, int(byte_length))
     mimetype, _ = mimetypes.guess_type(filename)
+    headers = {
+        "Cache-Control": "max-age=86400",
+    }
+    # When ?download=1 is set, force a save dialog. This bypasses cases
+    # where <a download> is ignored (e.g., sandboxed iframes without
+    # allow-downloads, or some Permissions-Policy configurations).
+    if request.query_params.get("download") == "1":
+        from marimo._convert.common.filename import make_download_headers
+
+        download_filename = request.query_params.get("filename") or filename
+        headers.update(make_download_headers(download_filename))
     # Do NOT set Content-Length here. StreamingResponse with an explicit
     # Content-Length causes h11 LocalProtocolError ("Too little data for
     # declared Content-Length") for large files. Omitting it lets h11 use
@@ -508,9 +567,7 @@ def virtual_file(
     return StreamingResponse(
         content=chunks,
         media_type=mimetype,
-        headers={
-            "Cache-Control": "max-age=86400",
-        },
+        headers=headers,
     )
 
 
@@ -595,7 +652,15 @@ async def serve_public_file(request: Request) -> Response:
 @router.get("/{path:path}")
 async def serve_static(request: Request) -> FileResponse:
     path = str(request.path_params["path"])
-    if any(re.match(pattern, path) for pattern in STATIC_FILES):
-        return FileResponse(root / path)
+    if any(re.fullmatch(pattern, path) for pattern in STATIC_FILES):
+        file_path = Path(path)
+        try:
+            PathValidator().validate_inside_directory(root, file_path)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Not Found") from None
+        resolved = root / path
+        if not resolved.is_file():
+            raise HTTPException(status_code=404, detail="Not Found")
+        return FileResponse(resolved)
 
     raise HTTPException(status_code=404, detail="Not Found")

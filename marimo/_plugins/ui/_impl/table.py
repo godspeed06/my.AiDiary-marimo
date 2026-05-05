@@ -9,6 +9,7 @@ from typing import (
     Any,
     Final,
     Literal,
+    Union,
     cast,
 )
 
@@ -97,8 +98,13 @@ class DownloadAsArgs:
 
 @dataclass
 class DownloadAsResponse:
-    url: str
-    filename: str
+    url: str = ""
+    filename: str = ""
+    # Populated when the requested format's dependencies are missing (e.g.,
+    # Parquet without pyarrow/pandas/polars). Mirrors the shape used by
+    # ColumnPreview so the frontend can reuse its install-prompt flow.
+    error: str | None = None
+    missing_packages: list[str] | None = None
 
 
 @dataclass
@@ -221,6 +227,45 @@ _DATATYPE_TO_CATEGORY: dict[str, str] = {
 }
 
 
+def _filters_reference_column(
+    group: FilterGroup, target_column: ColumnName
+) -> bool:
+    """True if any condition in the tree targets `target_column`."""
+    for child in group.children:
+        if isinstance(child, FilterCondition):
+            if child.column_id == target_column:
+                return True
+        elif isinstance(child, FilterGroup):
+            if _filters_reference_column(child, target_column):
+                return True
+    return False
+
+
+def _strip_filters_for_column(
+    group: FilterGroup, target_column: ColumnName
+) -> FilterGroup:
+    """Recursively remove conditions referencing the target column."""
+    valid_children: list[FilterCondition | FilterGroup] = []
+    for child in group.children:
+        if (
+            isinstance(child, FilterCondition)
+            and child.column_id == target_column
+        ):
+            continue
+        elif isinstance(child, FilterGroup):
+            stripped_child = _strip_filters_for_column(child, target_column)
+            if stripped_child.children:
+                valid_children.append(stripped_child)
+        else:
+            valid_children.append(child)
+    return FilterGroup(
+        type="group",
+        operator=group.operator,
+        children=tuple(valid_children),
+        negate=group.negate,
+    )
+
+
 def _filter_valid_columns(
     group: FilterGroup,
     column_dtypes: Mapping[str, str],
@@ -256,11 +301,13 @@ def _filter_valid_columns(
     )
 
 
+# Use Union[] instead of X | Y in class base — see altair_transformer.py
+# for rationale.
 @mddoc
 class table(
     UIElement[
-        list[str] | list[int] | list[dict[str, Any]],
-        list[JSONType] | IntoDataFrame | list[TableCell],
+        Union[list[str], list[int], list[dict[str, Any]]],
+        Union[list[JSONType], IntoDataFrame, list[TableCell]],
     ]
 ):
     """A table component with selectable rows.
@@ -571,6 +618,11 @@ class table(
             num_rows = self._manager.get_num_rows(force=True)
             total_rows = num_rows if num_rows is not None else "too_many"
 
+        # Most recent filter/query state from the frontend; used to rescope
+        # filter-aware computations like top-K. None until the first _search call.
+        self._current_filters: FilterGroup | None = None
+        self._current_query: str | None = None
+
         # Set the default value for show_column_summaries,
         # if it is not set by the user
         if show_column_summaries is None:
@@ -873,16 +925,52 @@ class table(
         current searched/filtered view. Raw data is downloaded without any
         formatting applied.
 
+        When a requested format requires a package that isn't installed
+        (e.g., Parquet without pyarrow/pandas/polars), returns a
+        ``DownloadAsResponse`` with ``error`` and ``missing_packages``
+        populated instead of raising. The frontend uses this to prompt the
+        user to install the dependency and retry.
+
         Args:
-            args (DownloadAsArgs): Arguments specifying the download format.
-                format must be one of 'csv' or 'json'.
+            args (DownloadAsArgs): The requested download format. Must be
+                one of ``'csv'``, ``'json'``, or ``'parquet'``.
 
         Returns:
-            DownloadAsResponse: URL and filename for the downloaded file.
+            DownloadAsResponse: Either a success response with ``url`` and
+                ``filename`` populated, or a missing-packages response with
+                ``error`` and ``missing_packages`` populated when the
+                format's dependencies are not available.
 
         Raises:
-            ValueError: If format is not 'csv' or 'json'.
+            NotImplementedError: If the current selection resolves to
+                something other than a ``TableManager`` (e.g., a raw list
+                of ``TableCell`` from cell-selection modes).
         """
+        # Short-circuit Parquet when no parquet-capable lib is importable.
+        if args.format == "parquet":
+            has_polars = DependencyManager.polars.has()
+            has_pandas = DependencyManager.pandas.has()
+            has_pyarrow = DependencyManager.pyarrow.has()
+
+            if not (has_polars or (has_pandas and has_pyarrow)):
+                # if pandas is installed and pyarrow is not, prompt to install pyarrow
+                if has_pandas:
+                    return DownloadAsResponse(
+                        error=(
+                            "Parquet export requires pyarrow. "
+                            "Please install pyarrow to enable parquet export."
+                        ),
+                        missing_packages=["pyarrow"],
+                    )
+                else:  # else prompt polars
+                    return DownloadAsResponse(
+                        error=(
+                            "Parquet export requires a DataFrame library. "
+                            "We recommend polars."
+                        ),
+                        missing_packages=["polars"],
+                    )
+
         # For cell-selection modes, ignore selection and download from the
         # searched/filtered view. For row-selection modes, preserve existing
         # behavior: download selected rows if any, otherwise the searched view.
@@ -1245,12 +1333,29 @@ class table(
     def _calculate_top_k_rows(
         self, args: CalculateTopKRowsArgs
     ) -> CalculateTopKRowsResponse:
-        """Calculate the top k rows in the table, grouped by column.
-        Returns a table of the top k rows, grouped by column with the count.
+        """Calculate the top k values for a column, with counts.
+
+        If the active filter set targets this column, those conditions are
+        stripped before computing top-K so the picker can surface values the
+        user's current filter would otherwise hide. Filters on other columns
+        and the search query still apply.
         """
         column, k = args.column, args.k
         try:
-            data = self._searched_manager.calculate_top_k_rows(column, k)
+            manager = self._searched_manager
+            current_filters = self._current_filters
+            if (
+                current_filters is not None
+                and current_filters.children
+                and _filters_reference_column(current_filters, column)
+            ):
+                stripped = _strip_filters_for_column(current_filters, column)
+                manager = self._apply_filters_query_sort(
+                    stripped if stripped.children else None,
+                    self._current_query,
+                    None,
+                )
+            data = manager.calculate_top_k_rows(column, k)
             return CalculateTopKRowsResponse(data=data)
         # Some libs will panic like Polars, which are only caught with BaseException
         except BaseException as e:
@@ -1463,6 +1568,9 @@ class table(
         max_columns = args.max_columns
         if max_columns == MAX_COLUMNS_NOT_PROVIDED:
             max_columns = self._max_columns
+
+        self._current_filters = args.filters
+        self._current_query = args.query
 
         def clamp_rows_and_columns(
             manager: TableManager[Any],
