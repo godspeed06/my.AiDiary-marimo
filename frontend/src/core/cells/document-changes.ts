@@ -156,10 +156,13 @@ function columnChanges(
   for (const [cellId, newCol] of newColumns) {
     const prevCol = prevColumns.get(cellId);
     if (prevCol !== newCol) {
+      const cell = getCell(cellId, newState);
       changes.push({
         type: "set-config",
         cellId: cellId,
         column: newCol,
+        disabled: cell?.config.disabled ?? false,
+        hideCode: cell?.config.hide_code ?? false,
       });
     }
   }
@@ -215,13 +218,14 @@ export function toDocumentChanges(
       ];
     }
 
-    // dropCellOverCell/dropCellOverColumn/moveCellToIndex → set-config + reorder-cells
+    // dropCellOverCell/dropCellOverColumn/moveCellToIndex/moveCellsRelativeTo → set-config + reorder-cells
     // Drag-and-drop reorders can move cells within or across columns.
     // We emit config changes for cells whose column changed, then
     // the full ordering.
     case "dropCellOverCell":
     case "dropCellOverColumn":
     case "moveCellToIndex":
+    case "moveCellsRelativeTo":
       return columnChanges(prevState, newState);
 
     // updateCellCode → set-code
@@ -257,18 +261,21 @@ export function toDocumentChanges(
     }
 
     // updateCellConfig → set-config
-    // Maps CellConfig's snake_case hide_code to the change's camelCase hideCode.
-    // Only includes fields that were actually specified in the partial config
-    // (from the action payload, not the full cell config).
+    // SetConfig is full-replacement: emit the cell's complete config from
+    // newState (which already merged the action's partial payload).
     case "updateCellConfig": {
-      const { cellId, config } = action.payload;
+      const { cellId } = action.payload;
+      const cell = getCell(cellId, newState);
+      if (!cell) {
+        return [];
+      }
       return [
         {
           type: "set-config",
           cellId: cellId,
-          ...(config.hide_code != null && { hideCode: config.hide_code }),
-          ...(config.disabled != null && { disabled: config.disabled }),
-          ...(config.column != null && { column: config.column }),
+          column: cell.config.column ?? null,
+          disabled: cell.config.disabled ?? false,
+          hideCode: cell.config.hide_code ?? false,
         },
       ];
     }
@@ -296,6 +303,10 @@ export function toDocumentChanges(
     case "undoDeleteCell": {
       const changes = newCellChanges(prevState, newState);
       const colChanges = columnChanges(prevState, newState);
+      // Undo-cut has no new cells — always emit reorder to sync the move.
+      if (changes.length === 0) {
+        return colChanges;
+      }
       // Only include column changes if layout actually changed
       // (colChanges always has at least a reorder-cells change)
       return colChanges.length > 1 ? [...changes, ...colChanges] : changes;
@@ -538,18 +549,15 @@ export function fromDocumentChanges(
         break;
 
       // set-config → updateCellConfig
-      // Maps the change's camelCase hideCode back to CellConfig's snake_case
-      // hide_code. Only includes fields that are non-null (null means
-      // "not specified" on the wire, not "clear the value").
       case "set-config":
         actions.push({
           type: "updateCellConfig",
           payload: {
             cellId: change.cellId,
             config: {
-              ...(change.hideCode != null && { hide_code: change.hideCode }),
-              ...(change.disabled != null && { disabled: change.disabled }),
-              ...(change.column != null && { column: change.column }),
+              column: change.column,
+              disabled: change.disabled,
+              hide_code: change.hideCode,
             },
           },
         });
@@ -650,7 +658,7 @@ export function applyTransactionChanges(
     ) {
       continue;
     }
-    if (change.type === "set-config" && change.column != null) {
+    if (change.type === "set-config") {
       hasColumnChange = true;
     }
     if (change.type === "create-cell" && change.config?.column != null) {

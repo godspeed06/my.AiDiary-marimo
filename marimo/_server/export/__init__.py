@@ -41,6 +41,9 @@ from marimo._server.models.models import InstantiateNotebookRequest
 from marimo._session.model import ConnectionState, SessionMode
 from marimo._session.notebook import AppFileManager, load_notebook
 from marimo._types.ids import ConsumerId
+from marimo._utils.inline_script_metadata import (
+    pin_pep723_dependencies_for_wasm,
+)
 from marimo._utils.marimo_path import MarimoPath
 
 LOGGER = _loggers.marimo_logger()
@@ -347,6 +350,62 @@ async def run_app_then_export_as_html(
             files=[],
             asset_url=asset_url,
         ),
+    )
+    return ExportResult(
+        contents=html,
+        download_filename=filename,
+        did_error=did_error,
+    )
+
+
+async def run_app_then_export_as_wasm(
+    path: MarimoPath,
+    mode: Literal["edit", "run"],
+    show_code: bool,
+    cli_args: SerializedCLIArgs,
+    argv: list[str],
+    *,
+    asset_url: str | None = None,
+) -> ExportResult:
+    """Execute notebook and export as WASM HTML with embedded session."""
+    from marimo._session.state.serialize import (
+        serialize_notebook,
+        serialize_session_view,
+    )
+
+    file_manager = load_notebook(path.absolute_name)
+    file_manager.app.inline_layout_file()
+
+    config = get_default_config_manager(current_path=file_manager.path)
+    display_config = cast(DisplayConfig, config.get_config()["display"])
+
+    session_view, did_error = await run_app_until_completion(
+        file_manager,
+        cli_args,
+        argv=argv,
+    )
+
+    session_snapshot = serialize_session_view(
+        session_view,
+        cell_ids=file_manager.app.cell_manager.cell_ids(),
+        drop_virtual_file_outputs=True,
+    )
+    notebook_snapshot = serialize_notebook(
+        session_view, file_manager.app.cell_manager
+    )
+
+    code = pin_pep723_dependencies_for_wasm(file_manager.app.to_py(), path)
+
+    html, filename = Exporter().export_as_wasm(
+        filename=file_manager.filename,
+        app=file_manager.app,
+        display_config=display_config,
+        code=code,
+        mode=mode,
+        show_code=show_code,
+        asset_url=asset_url,
+        session_snapshot=session_snapshot,
+        notebook_snapshot=notebook_snapshot,
     )
     return ExportResult(
         contents=html,

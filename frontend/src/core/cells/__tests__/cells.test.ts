@@ -46,6 +46,9 @@ vi.mock("@/core/codemirror/editing/commands", () => ({
   foldAllBulk: vi.fn(),
   unfoldAllBulk: vi.fn(),
 }));
+vi.mock("@/core/wasm/utils", () => ({
+  isWasm: vi.fn(() => false),
+}));
 vi.mock("../scrollCellIntoView", async (importOriginal) => {
   const actual = await importOriginal();
   return {
@@ -207,6 +210,20 @@ describe("cell reducer", () => {
       [0] ''
       "
     `);
+  });
+
+  it("can add a cell with name and config", () => {
+    actions.createNewCell({
+      cellId: firstCellId,
+      before: false,
+      code: "x = 1",
+      name: "My Cell",
+      config: { hide_code: true, disabled: false },
+    });
+    const newCellId = state.cellIds.inOrderIds[1];
+    expect(state.cellData[newCellId].name).toBe("My Cell");
+    expect(state.cellData[newCellId].config.hide_code).toBe(true);
+    expect(state.cellData[newCellId].config.disabled).toBe(false);
   });
 
   it("can delete a Python cell and undo delete", () => {
@@ -597,6 +614,179 @@ describe("cell reducer", () => {
     });
 
     expect(formatCells(state)).toBe(before);
+  });
+
+  it("can move multiple cells relative to target", () => {
+    actions.createNewCell({
+      cellId: firstCellId,
+      before: false,
+    });
+    actions.createNewCell({
+      cellId: cellId("1"),
+      before: false,
+    });
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [0] ''
+
+      [1] ''
+
+      [2] ''
+      "
+    `);
+
+    // Move first two cells after the third
+    actions.moveCellsRelativeTo({
+      cellIds: [firstCellId, cellId("1")],
+      targetCellId: cellId("2"),
+      position: "after",
+    });
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [2] ''
+
+      [0] ''
+
+      [1] ''
+      "
+    `);
+  });
+
+  it("can undo cut-paste (move with previousPlacements)", () => {
+    actions.createNewCell({
+      cellId: firstCellId,
+      before: false,
+    });
+    actions.createNewCell({
+      cellId: cellId("1"),
+      before: false,
+    });
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [0] ''
+
+      [1] ''
+
+      [2] ''
+      "
+    `);
+
+    const col = state.cellIds.findWithId(firstCellId);
+    const previousPlacements = [
+      {
+        columnId: col.id,
+        index: col.indexOfOrThrow(
+          firstCellId,
+        ) as import("@/utils/id-tree").CellIndex,
+      },
+      {
+        columnId: col.id,
+        index: col.indexOfOrThrow(
+          cellId("1"),
+        ) as import("@/utils/id-tree").CellIndex,
+      },
+    ];
+
+    actions.moveCellsRelativeTo({
+      cellIds: [firstCellId, cellId("1")],
+      targetCellId: cellId("2"),
+      position: "after",
+      previousPlacements,
+    });
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [2] ''
+
+      [0] ''
+
+      [1] ''
+      "
+    `);
+
+    actions.undoDeleteCell();
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [0] ''
+
+      [1] ''
+
+      [2] ''
+      "
+    `);
+  });
+
+  it("undo order: cut-paste then delete — first undo restores delete, second undo undoes move", () => {
+    actions.createNewCell({
+      cellId: firstCellId,
+      before: false,
+    });
+    actions.createNewCell({
+      cellId: cellId("1"),
+      before: false,
+    });
+
+    const col = state.cellIds.findWithId(firstCellId);
+    const previousPlacements = [
+      {
+        columnId: col.id,
+        index: col.indexOfOrThrow(
+          firstCellId,
+        ) as import("@/utils/id-tree").CellIndex,
+      },
+      {
+        columnId: col.id,
+        index: col.indexOfOrThrow(
+          cellId("1"),
+        ) as import("@/utils/id-tree").CellIndex,
+      },
+    ];
+
+    actions.moveCellsRelativeTo({
+      cellIds: [firstCellId, cellId("1")],
+      targetCellId: cellId("2"),
+      position: "after",
+      previousPlacements,
+    });
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [2] ''
+
+      [0] ''
+
+      [1] ''
+      "
+    `);
+
+    actions.deleteCell({ cellId: cellId("2") });
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [0] ''
+
+      [1] ''
+      "
+    `);
+
+    actions.undoDeleteCell();
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [3] ''
+
+      [0] ''
+
+      [1] ''
+      "
+    `);
+
+    actions.undoDeleteCell();
+    expect(formatCells(state)).toMatchInlineSnapshot(`
+      "
+      [0] ''
+
+      [1] ''
+
+      [3] ''
+      "
+    `);
   });
 
   it("can run cell and receive cell messages", () => {
@@ -3426,5 +3616,101 @@ describe("createTracebackInfoAtom", () => {
     const traceback = store.get(tracebackAtom);
 
     expect(traceback).toBeUndefined();
+  });
+});
+
+describe("setCells snapshot preservation", () => {
+  const CELL_A = cellId("A");
+  const CELL_B = cellId("B");
+  const newCells: CellData[] = [
+    {
+      id: CELL_A,
+      name: "a",
+      code: "1",
+      edited: false,
+      lastCodeRun: null,
+      lastExecutionTime: null,
+      config: { hide_code: false, disabled: false, column: null },
+      serializedEditorState: null,
+    },
+    {
+      id: CELL_B,
+      name: "b",
+      code: "2",
+      edited: false,
+      lastCodeRun: null,
+      lastExecutionTime: null,
+      config: { hide_code: false, disabled: false, column: null },
+      serializedEditorState: null,
+    },
+  ];
+
+  const hydratedState = () =>
+    MockNotebook.notebookState({
+      cellData: {
+        [CELL_A]: { id: CELL_A, code: "1" },
+        [CELL_B]: { id: CELL_B, code: "2" },
+      },
+      cellRuntime: {
+        [CELL_A]: {
+          output: {
+            channel: "output",
+            mimetype: "text/plain",
+            data: "hydrated-A",
+            timestamp: 0,
+          },
+        },
+        [CELL_B]: {
+          consoleOutputs: [
+            {
+              channel: "stdout",
+              mimetype: "text/plain",
+              data: "hydrated-B-stdout",
+              timestamp: 0,
+            },
+          ],
+        },
+      },
+    });
+
+  beforeEach(async () => {
+    const { isWasm } = await import("@/core/wasm/utils");
+    vi.mocked(isWasm).mockReturnValue(true);
+  });
+
+  it("preserves hydrated output in WASM", () => {
+    const next = exportedForTesting.reducer(hydratedState(), {
+      type: "setCells",
+      payload: newCells,
+    });
+
+    expect(next.cellRuntime[CELL_A].output).toMatchObject({
+      data: "hydrated-A",
+    });
+  });
+
+  it("preserves console-only hydration in WASM", () => {
+    const next = exportedForTesting.reducer(hydratedState(), {
+      type: "setCells",
+      payload: newCells,
+    });
+
+    expect(next.cellRuntime[CELL_B].consoleOutputs).toHaveLength(1);
+    expect(next.cellRuntime[CELL_B].consoleOutputs[0]).toMatchObject({
+      data: "hydrated-B-stdout",
+    });
+  });
+
+  it("resets cells with no prior runtime even in WASM", () => {
+    const empty = MockNotebook.notebookState({ cellData: {} });
+    const next = exportedForTesting.reducer(empty, {
+      type: "setCells",
+      payload: newCells,
+    });
+
+    expect(next.cellRuntime[CELL_A].output).toBeNull();
+    expect(next.cellRuntime[CELL_A].consoleOutputs).toEqual([]);
+    expect(next.cellRuntime[CELL_B].output).toBeNull();
+    expect(next.cellRuntime[CELL_B].consoleOutputs).toEqual([]);
   });
 });

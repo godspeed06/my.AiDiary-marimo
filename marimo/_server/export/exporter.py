@@ -25,7 +25,10 @@ from marimo._convert.common.filename import (
     get_download_filename,
     get_filename,
 )
-from marimo._convert.ipynb.from_ir import convert_from_ir_to_ipynb
+from marimo._convert.ipynb.from_ir import (
+    NBCONVERT_REMOVE_INPUT_TAG,
+    convert_from_ir_to_ipynb,
+)
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._messaging.mimetypes import KnownMimeType
 from marimo._runtime.virtual_file import read_virtual_file
@@ -54,6 +57,8 @@ from marimo._version import __version__
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from traitlets.config import Config
+
     from marimo._server.export._status import PDFExportStatusCallback
 
 LOGGER = _loggers.marimo_logger()
@@ -67,6 +72,20 @@ VIRTUAL_FILE_ALLOWED_TAGS = {"img", "audio", "video"}
 # Files exceeding this limit are replaced with a text/plain placeholder
 # so users see a clear message instead of a broken link.
 MAX_VIRTUAL_FILE_INLINE_BYTES = 10 * 1024 * 1024
+
+
+def _nbconvert_tag_remove_config() -> Config:
+    """Build a traitlets config that strips inputs from cells tagged with
+    `NBCONVERT_REMOVE_INPUT_TAG`. Used to honor `hide_code=True` in nbconvert
+    exports."""
+    from traitlets.config import Config
+
+    config = Config()
+    config.TagRemovePreprocessor.enabled = True
+    config.TagRemovePreprocessor.remove_input_tags = (
+        NBCONVERT_REMOVE_INPUT_TAG,
+    )
+    return config
 
 
 class Exporter:
@@ -328,6 +347,8 @@ class Exporter:
         mode: Literal["edit", "run"],
         show_code: bool,
         asset_url: str | None = None,
+        session_snapshot: NotebookSessionV1 | None = None,
+        notebook_snapshot: NotebookV1 | None = None,
     ) -> tuple[str, str]:
         """Export notebook as a WASM-powered standalone HTML file."""
         index_html = get_html_contents()
@@ -350,6 +371,8 @@ class Exporter:
             code=code,
             asset_url=asset_url,
             show_code=show_code,
+            session_snapshot=session_snapshot,
+            notebook_snapshot=notebook_snapshot,
         )
 
         download_filename = get_download_filename(filename, "wasm.html")
@@ -441,7 +464,9 @@ class Exporter:
                     phase="render",
                     message="rendering PDF via standard exporter...",
                 )
-                exporter = PDFExporter()  # type: ignore[no-untyped-call]
+                exporter = PDFExporter(  # type: ignore[no-untyped-call]
+                    config=_nbconvert_tag_remove_config(),
+                )
                 exporter.exclude_input = not include_inputs
                 pdf_data, _resources = exporter.from_notebook_node(notebook)  # type: ignore[no-untyped-call]
                 if isinstance(pdf_data, bytes):
@@ -475,7 +500,9 @@ class Exporter:
             phase="render",
             message="rendering PDF via WebPDF...",
         )
-        web_exporter = WebPDFExporter()  # type: ignore[no-untyped-call]
+        web_exporter = WebPDFExporter(  # type: ignore[no-untyped-call]
+            config=_nbconvert_tag_remove_config(),
+        )
         web_exporter.exclude_input = not include_inputs
         web_exporter.allow_chromium_download = True
         pdf_data, _resources = web_exporter.from_notebook_node(notebook)  # type: ignore[no-untyped-call]
@@ -586,7 +613,9 @@ class Exporter:
             )
 
         # Convert to reveal.js HTML
-        slides_exporter = SlidesExporter()  # type: ignore[no-untyped-call]
+        slides_exporter = SlidesExporter(  # type: ignore[no-untyped-call]
+            config=_nbconvert_tag_remove_config(),
+        )
         slides_exporter.exclude_input = not include_inputs
         html_data, _resources = slides_exporter.from_notebook_node(notebook)
 
