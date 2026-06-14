@@ -260,6 +260,71 @@ class TestSetCode:
 
 
 # ------------------------------------------------------------------
+# Per-cell version
+# ------------------------------------------------------------------
+
+
+class TestCellVersion:
+    def test_new_cell_starts_at_zero(self) -> None:
+        doc = _doc()
+        doc.apply(
+            _tx(
+                CreateCell(
+                    cell_id=CellId_t("a"),
+                    code="x",
+                    name="__",
+                    config=CellConfig(),
+                )
+            )
+        )
+        assert doc.get_cell_version(CellId_t("a")) == 0
+
+    def test_set_code_bumps_version(self) -> None:
+        doc = _doc("a")
+        assert doc.get_cell_version(CellId_t("a")) == 0
+        doc.apply(_tx(SetCode(cell_id=CellId_t("a"), code="x")))
+        assert doc.get_cell_version(CellId_t("a")) == 1
+        doc.apply(_tx(SetCode(cell_id=CellId_t("a"), code="y")))
+        assert doc.get_cell_version(CellId_t("a")) == 2
+
+    def test_no_op_set_code_does_not_bump(self) -> None:
+        doc = _doc("a")
+        doc.apply(_tx(SetCode(cell_id=CellId_t("a"), code="x")))
+        assert doc.get_cell_version(CellId_t("a")) == 1
+        # Re-applying the same code is a no-op (e.g. format-on-save).
+        doc.apply(_tx(SetCode(cell_id=CellId_t("a"), code="x")))
+        assert doc.get_cell_version(CellId_t("a")) == 1
+
+    def test_other_changes_do_not_bump_version(self) -> None:
+        doc = _doc("a")
+        doc.apply(_tx(SetName(cell_id=CellId_t("a"), name="my_cell")))
+        assert doc.get_cell_version(CellId_t("a")) == 0
+        doc.apply(
+            _tx(
+                SetConfig(
+                    cell_id=CellId_t("a"),
+                    column=None,
+                    disabled=True,
+                    hide_code=False,
+                )
+            )
+        )
+        assert doc.get_cell_version(CellId_t("a")) == 0
+
+    def test_get_cell_version_missing(self) -> None:
+        doc = _doc("a")
+        assert doc.get_cell_version(CellId_t("missing")) is None
+
+    def test_rekey_preserves_version(self) -> None:
+        doc = _doc("a")
+        doc.apply(_tx(SetCode(cell_id=CellId_t("a"), code="x")))
+        doc.apply(_tx(SetCode(cell_id=CellId_t("a"), code="y")))
+        assert doc.get_cell_version(CellId_t("a")) == 2
+        doc._rekey({CellId_t("a"): CellId_t("x")})
+        assert doc.get_cell_version(CellId_t("x")) == 2
+
+
+# ------------------------------------------------------------------
 # SetName
 # ------------------------------------------------------------------
 
@@ -449,22 +514,6 @@ class TestVersion:
         applied = doc.apply(_tx())
         assert doc.version == 1
         assert applied.version == 1
-
-    def test_replace_cells_bumps_version(self) -> None:
-        doc = _doc("a", "b")
-        starting = doc.version
-        doc._replace_cells([_cell("c"), _cell("d")])
-        assert doc.version == starting + 1
-
-    def test_replace_cells_preserves_document_identity(self) -> None:
-        doc = _doc("a")
-        new_cells = [_cell("b"), _cell("c")]
-        doc._replace_cells(new_cells)
-        assert _ids(doc) == ["b", "c"]
-        # Reassigning the cells list — not mutating in place — lets prior
-        # holders (e.g. file-watch diff path) keep a snapshot of the
-        # pre-rebuild state for comparison.
-        assert doc._cells is new_cells
 
     def test_rekey_bumps_version(self) -> None:
         doc = _doc("a", "b")

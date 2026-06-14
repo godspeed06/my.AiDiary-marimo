@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -120,7 +119,7 @@ class Linter:
     def _rule_engine_for_file(self, file_path: str) -> RuleEngine:
         """Return a RuleEngine for the given file.
 
-        If the file contains PEP 723 ``[tool.marimo.lint]`` metadata and no
+        If the file contains PEP 723 `[tool.marimo.lint]` metadata and no
         explicit rules were provided, create a per-file engine that merges
         the file-level config with the global lint config.
         """

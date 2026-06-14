@@ -31,7 +31,7 @@ MarimoFileKey = str
 class NotebookWorkspace(abc.ABC):
     """A server-side abstraction for the set of notebooks a server is hosting.
 
-    Owned by ``SessionManager``. Handles workspace browsing, allowlisting, lazy
+    Owned by `SessionManager`. Handles workspace browsing, allowlisting, lazy
     directory scanning, and security validation.
     """
 
@@ -55,7 +55,7 @@ class NotebookWorkspace(abc.ABC):
 
     @abc.abstractmethod
     def resolve(self, key: MarimoFileKey) -> str | None:
-        """Resolve a key to an absolute path; ``None`` for new files.
+        """Resolve a key to an absolute path; `None` for new files.
 
         Useful for endpoints that need file-backed resources (e.g. thumbnails)
         without the overhead of parsing/loading a notebook.
@@ -66,10 +66,10 @@ class NotebookWorkspace(abc.ABC):
         key: MarimoFileKey,
         defaults: AppDefaults | None = None,
     ) -> AppFileManager:
-        """Load the notebook for the given key into an ``AppFileManager``.
+        """Load the notebook for the given key into an `AppFileManager`.
 
-        Built on top of :meth:`resolve` — subclasses customize ``resolve`` and
-        inherit the right ``load`` semantics for free.
+        Built on top of :meth:`resolve` — subclasses customize `resolve` and
+        inherit the right `load` semantics for free.
         """
         defaults = defaults or AppDefaults()
         resolved = self.resolve(key)
@@ -91,7 +91,7 @@ class NotebookWorkspace(abc.ABC):
     def register_allowed_path(self, path: str) -> None:
         """Allow a file path that wasn't part of the original collection.
 
-        No-op by default. ``SingleFileWorkspace`` overrides to extend its
+        No-op by default. `SingleFileWorkspace` overrides to extend its
         allowlist for files created at runtime.
         """
         del path
@@ -99,15 +99,15 @@ class NotebookWorkspace(abc.ABC):
     def register_temp_dir(self, temp_dir: str) -> None:
         """Register a temp directory as allowed for file access.
 
-        No-op by default. ``DirectoryWorkspace`` overrides for tutorial
+        No-op by default. `DirectoryWorkspace` overrides for tutorial
         support.
         """
         del temp_dir
 
     def is_in_allowed_temp_dir(self, path: str) -> bool:
-        """Whether ``path`` lives inside an allowed temp directory.
+        """Whether `path` lives inside an allowed temp directory.
 
-        Returns ``False`` by default. ``DirectoryWorkspace`` overrides.
+        Returns `False` by default. `DirectoryWorkspace` overrides.
         """
         del path
         return False
@@ -115,13 +115,13 @@ class NotebookWorkspace(abc.ABC):
     def invalidate(self) -> None:  # noqa: B027 — intentional no-op default
         """Invalidate any cached listing.
 
-        No-op by default. ``DirectoryWorkspace`` overrides.
+        No-op by default. `DirectoryWorkspace` overrides.
         """
 
     def set_include_markdown(self, include_markdown: bool) -> None:
         """Toggle markdown inclusion in directory listings.
 
-        No-op by default. ``DirectoryWorkspace`` overrides — mutates in
+        No-op by default. `DirectoryWorkspace` overrides — mutates in
         place.
         """
         del include_markdown

@@ -15,10 +15,12 @@ from marimo._config.config import (
     DEFAULT_CONFIG,
     DisplayConfig,
     MarimoConfig,
+    SharingConfig,
 )
 from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._config.utils import deep_copy
 from marimo._convert.common.dom_traversal import (
+    replace_public_files_with_data_uris,
     replace_virtual_files_with_data_uris,
 )
 from marimo._convert.common.filename import (
@@ -55,7 +57,7 @@ from marimo._utils.paths import marimo_package_path, notebook_output_dir
 from marimo._version import __version__
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
     from traitlets.config import Config
 
@@ -101,12 +103,13 @@ class Exporter:
         session_view: SessionView,
         display_config: DisplayConfig,
         request: ExportAsHTMLRequest,
+        sharing_config: SharingConfig | None = None,
     ) -> tuple[str, str]:
         index_html = get_html_contents()
         filename = get_filename(filename)
 
-        # Configure notebook with display settings
-        config = self._prepare_display_config(display_config)
+        # Configure notebook with display and sharing settings
+        config = self._prepare_display_config(display_config, sharing_config)
 
         # Serialize notebook state
         session_snapshot = serialize_session_view(
@@ -120,6 +123,13 @@ class Exporter:
         session_snapshot, replaced_files = self._inline_virtual_files(
             session_snapshot
         )
+
+        # Inline references to files in the notebook's `public/` folder so
+        # the exported HTML is self-contained. Without this, `mo.md` images
+        # like `![alt](public/image.png)` break when the HTML is opened
+        # outside the notebook's directory.
+        public_dir = Path(filename).resolve().parent / "public"
+        self._inline_public_files(session_snapshot, public_dir)
 
         app_code = app.to_py()
 
@@ -157,16 +167,37 @@ class Exporter:
         return html, download_filename
 
     def _prepare_display_config(
-        self, display_config: DisplayConfig
+        self,
+        display_config: DisplayConfig,
+        sharing_config: SharingConfig | None = None,
     ) -> MarimoConfig:
-        """Prepare config with display settings for static notebook."""
-        # We only want pass the display config in the static notebook,
-        # since we use:
-        # - display.theme
-        # - display.cell_output
-        config = deep_copy(DEFAULT_CONFIG)
+        """Prepare config with display and sharing settings for static notebook."""
+        config: MarimoConfig = deep_copy(DEFAULT_CONFIG)
         config["display"] = display_config
-        return cast(MarimoConfig, config)
+        if sharing_config:
+            config["sharing"] = sharing_config
+        return config
+
+    @staticmethod
+    def _iter_html_data_strings(
+        session_snapshot: NotebookSessionV1,
+    ) -> Iterator[tuple[dict[str, Any], str, str]]:
+        """Yield (output_data_dict, mime_type, data) for each `text/html`
+        string output.
+
+        Only `text/html` outputs are returned: non-HTML mime entries (e.g.
+        `text/plain`, `application/json`) must not be HTML-parsed, since
+        their content is opaque to the attribute-replacement logic.
+        """
+        for cell in session_snapshot["cells"]:
+            for output in cell["outputs"]:
+                if output["type"] != "data":
+                    continue
+                for mime_type, data in output["data"].items():
+                    if mime_type != "text/html":
+                        continue
+                    if isinstance(data, str):
+                        yield output["data"], mime_type, data
 
     def _inline_virtual_files(
         self, session_snapshot: NotebookSessionV1
@@ -178,27 +209,45 @@ class Exporter:
         """
         replaced_files: set[str] = set()
 
-        for cell in session_snapshot["cells"]:
-            for output in cell["outputs"]:
-                if output["type"] != "data":
-                    continue
-
-                for mime_type, data in output["data"].items():
-                    if not isinstance(data, str):
-                        continue
-                    if self._VIRTUAL_FILE_PATTERN not in data:
-                        continue
-
-                    processed, files = replace_virtual_files_with_data_uris(
-                        data,
-                        allowed_tags=VIRTUAL_FILE_ALLOWED_TAGS,
-                        allowed_attributes=VIRTUAL_FILE_ALLOWED_ATTRIBUTES,
-                        max_inline_bytes=MAX_VIRTUAL_FILE_INLINE_BYTES,
-                    )
-                    replaced_files.update(files)
-                    output["data"][mime_type] = processed
+        for data_dict, mime_type, data in self._iter_html_data_strings(
+            session_snapshot
+        ):
+            if self._VIRTUAL_FILE_PATTERN not in data:
+                continue
+            processed, files = replace_virtual_files_with_data_uris(
+                data,
+                allowed_tags=VIRTUAL_FILE_ALLOWED_TAGS,
+                allowed_attributes=VIRTUAL_FILE_ALLOWED_ATTRIBUTES,
+                max_inline_bytes=MAX_VIRTUAL_FILE_INLINE_BYTES,
+            )
+            replaced_files.update(files)
+            data_dict[mime_type] = processed
 
         return session_snapshot, replaced_files
+
+    def _inline_public_files(
+        self,
+        session_snapshot: NotebookSessionV1,
+        public_dir: Path,
+    ) -> None:
+        """Replace `public/`-prefixed file paths in HTML outputs with data URIs.
+
+        Mutates `session_snapshot` in-place.
+        """
+        if not public_dir.exists():
+            return
+
+        for data_dict, mime_type, data in self._iter_html_data_strings(
+            session_snapshot
+        ):
+            if "public/" not in data:
+                continue
+            processed, _ = replace_public_files_with_data_uris(
+                data,
+                public_dir=public_dir,
+                max_inline_bytes=MAX_VIRTUAL_FILE_INLINE_BYTES,
+            )
+            data_dict[mime_type] = processed
 
     def _prepare_code(
         self,
@@ -349,14 +398,13 @@ class Exporter:
         asset_url: str | None = None,
         session_snapshot: NotebookSessionV1 | None = None,
         notebook_snapshot: NotebookV1 | None = None,
+        sharing_config: SharingConfig | None = None,
     ) -> tuple[str, str]:
         """Export notebook as a WASM-powered standalone HTML file."""
         index_html = get_html_contents()
         filename = get_filename(filename)
 
-        # We only want to pass the display config in the static notebook
-        config: MarimoConfig = deep_copy(DEFAULT_CONFIG)
-        config["display"] = display_config
+        config = self._prepare_display_config(display_config, sharing_config)
         # Remove autosave
         config["save"]["autosave"] = "off"
 
@@ -746,7 +794,7 @@ class AutoExporter:
         filepath = export_dir / download_name
 
         # Run blocking file I/O in thread pool
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             self._executor, self._write_file_sync, filepath, content
         )

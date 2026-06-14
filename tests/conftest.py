@@ -80,6 +80,31 @@ def pytest_collection_modifyitems(
             item.add_marker(pytest.mark.skip(reason=reason))
 
 
+# Captured at conftest import time (i.e. at worker startup, before any test
+# runs on any xdist worker), so the on-disk file can be mutated mid-session by
+# a leaking `uv add` without corrupting `tests/test_project_dependencies.py`.
+_PYPROJECT_PATH = Path(__file__).parent.parent / "pyproject.toml"
+_PYPROJECT_TEXT_AT_SESSION_START = (
+    _PYPROJECT_PATH.read_text() if _PYPROJECT_PATH.is_file() else None
+)
+
+
+@pytest.fixture(scope="session")
+def pyproject_text() -> str:
+    """`pyproject.toml` content as it was at session start.
+
+    Use this instead of reading `pyproject.toml` directly in tests so the
+    read is immune to mid-session mutations by parallel tests (e.g. a
+    leaking real `uv add`).
+    """
+    if _PYPROJECT_TEXT_AT_SESSION_START is None:
+        pytest.fail(
+            f"pyproject.toml not found at {_PYPROJECT_PATH} when conftest "
+            f"was imported."
+        )
+    return _PYPROJECT_TEXT_AT_SESSION_START
+
+
 @pytest.fixture(scope="session")
 def _venv_canary_path() -> Path | None:
     """Resolve an on-disk file whose existence signals the test venv is intact.
@@ -343,10 +368,12 @@ def mocked_kernel() -> Generator[MockedKernel, None, None]:
 # Installs an execution context without stream redirection
 @pytest.fixture
 def executing_kernel() -> Generator[Kernel, None, None]:
+    from marimo._messaging.types import KernelStreams
+
     mocked = MockedKernel.open()
-    mocked.k.stdout = None
-    mocked.k.stderr = None
-    mocked.k.stdin = None
+    mocked.k._streams = KernelStreams(
+        stream=mocked.k.stream, stdout=None, stderr=None, stdin=None
+    )
     with mocked.k._install_execution_context(cell_id="0"):
         yield mocked.k
     mocked.teardown()
@@ -434,9 +461,9 @@ def exec_req() -> ExecReqProvider:
 class MockPyodide:
     """Simulate running in a Pyodide environment.
 
-    Patches ``sys.platform`` to ``"emscripten"`` so ``is_pyodide()`` returns
-    True, and stubs ``pyodide`` (plus any ``extra_modules``) in
-    ``sys.modules`` so ``import pyodide`` (and friends) succeeds.
+    Patches `sys.platform` to `"emscripten"` so `is_pyodide()` returns
+    True, and stubs `pyodide` (plus any `extra_modules`) in
+    `sys.modules` so `import pyodide` (and friends) succeeds.
 
     Usable as a context manager or as a decorator on sync or async tests::
 

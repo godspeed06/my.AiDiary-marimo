@@ -94,7 +94,8 @@ components:
       title: AiCompletionRequest
       type: object
     AiConfig:
-      description: "Configuration options for AI.\n\n    **Keys.**\n\n    - `rules`:\
+      description: "Configuration options for AI.\n\n    **Keys.**\n\n    - `enabled`:\
+        \ if `False`, hide AI actions and panels in the marimo UI\n    - `rules`:\
         \ custom rules to include in all AI completion prompts\n    - `max_tokens`:\
         \ the maximum number of tokens to use in AI completions\n    - `mode`: the\
         \ mode to use for AI completions. Can be one of: `\"ask\"` or `\"manual\"\
@@ -119,6 +120,8 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/OpenAiConfig'
           type: object
+        enabled:
+          type: boolean
         github:
           $ref: '#/components/schemas/GitHubConfig'
         google:
@@ -377,16 +380,18 @@ components:
       format: cell-id
       type: string
     CellNotification:
-      description: "Updates a cell's state in the frontend.\n\n    Only fields that\
-        \ are set (not None) will update the cell state.\n    Omitting a field leaves\
-        \ that aspect unchanged.\n\n    Attributes:\n        cell_id: Unique identifier\
-        \ of the cell being updated.\n        output: Cell's output. Use CellOutput.empty()\
-        \ to clear.\n        console: Console messages. Single/list appends, [] clears,\
-        \ None unchanged.\n        status: Execution status (idle/running/stale/queued/disabled-transitively).\n\
+      description: "Updates a cell's state in the frontend.\n\n    This is a partial\
+        \ update: each field carries its own \"unchanged\" semantics,\n    documented\
+        \ per field below. Most fields treat None as \"unchanged\"; fields\n    that\
+        \ need to distinguish \"unchanged\" from \"clear\" use msgspec.UNSET for the\n\
+        \    former and None for the latter.\n\n    Attributes:\n        cell_id:\
+        \ Unique identifier of the cell being updated.\n        output: Cell's output.\
+        \ Use CellOutput.empty() to clear.\n        console: Console messages. Single/list\
+        \ appends, [] clears, None unchanged.\n        status: Execution status (idle/running/stale/queued/disabled-transitively).\n\
         \        stale_inputs: Whether cell has stale inputs from changed dependencies.\n\
         \        run_id: Execution run ID for tracing. Auto-set from context.\n  \
-        \      serialization: Serialization status (TopLevelHints).\n        timestamp:\
-        \ Creation timestamp, auto-set."
+        \      serialization: Top-level reusability hint. UNSET unchanged, None clears,\
+        \ str sets.\n        timestamp: Creation timestamp, auto-set."
       properties:
         cell_id:
           $ref: '#/components/schemas/CellId'
@@ -415,7 +420,6 @@ components:
           anyOf:
           - type: string
           - type: 'null'
-          default: null
         stale_inputs:
           anyOf:
           - type: boolean
@@ -510,6 +514,28 @@ components:
       - mimetype
       - data
       title: CellOutput
+      type: object
+    CellOutputs:
+      description: "Per-cell output snapshot delivered alongside the document snapshot.\n\
+        \n    `output` carries the cell's last main (rich display) output;\n    `console_outputs`\
+        \ carries the buffered stdout/stderr stream from\n    its last execution.\
+        \  Both are keyed by cell id; missing keys mean\n    \"no output captured\"\
+        \ (the cell never ran, or produced nothing on\n    that channel)."
+      properties:
+        console_outputs:
+          additionalProperties:
+            items:
+              $ref: '#/components/schemas/CellOutput'
+            type: array
+          type: object
+        output:
+          additionalProperties:
+            $ref: '#/components/schemas/CellOutput'
+          type: object
+      required:
+      - output
+      - console_outputs
+      title: CellOutputs
       type: object
     ChatAttachment:
       properties:
@@ -733,10 +759,10 @@ components:
     CompletedRunNotification:
       description: "Run of submitted cells and descendants completed.\n\n    Attributes:\n\
         \        run_id: Correlation ID echoed from the command that triggered\n \
-        \           this completion. ``None`` for handlers that don't take a\n   \
-        \         ``run_id`` (everything except ``handle_execute_scratchpad``\n  \
-        \          today). Consumers that want to wait for a specific command's\n\
-        \            completion filter on this field."
+        \           this completion. `None` for handlers that don't take a\n     \
+        \       `run_id` (everything except `handle_execute_scratchpad`\n        \
+        \    today). Consumers that want to wait for a specific command's\n      \
+        \      completion filter on this field."
       properties:
         op:
           enum:
@@ -757,7 +783,8 @@ components:
         \ the completion hotkey is entered\n    - `signature_hint_on_typing`: if `False`,\
         \ signature hint won't be shown when typing\n    - `copilot`: one of `\"github\"\
         `, `\"codeium\"`, or `\"custom\"`\n    - `codeium_api_key`: the Codeium API\
-        \ key"
+        \ key\n    - `auto_close_pairs`: if `False`, typing an opening bracket, parenthesis,\n\
+        \    or quote will not automatically insert the closing character"
       properties:
         activate_on_typing:
           type: boolean
@@ -765,6 +792,8 @@ components:
           anyOf:
           - type: string
           - type: 'null'
+        auto_close_pairs:
+          type: boolean
         base_url:
           anyOf:
           - type: string
@@ -830,6 +859,38 @@ components:
       - prefix_length
       - options
       title: CompletionResultNotification
+      type: object
+    ConsumerCapabilities:
+      description: "Per-consumer access capabilities for a session connection.\n\n\
+        \    - editor: `{edit: True, interact: True}`\n    - viewer: `{edit: False,\
+        \ interact: False}`\n\n    These gate the frontend UI; they are not the server's\
+        \ authority boundary.\n    Scopes are granted per session mode (see `@requires`),\
+        \ so in an edit session\n    every connection (viewers included) carries the\
+        \ `edit` scope and can issue\n    edit requests. A viewer's read-only status\
+        \ is enforced by the client hiding\n    edit affordances, not by the server\
+        \ rejecting the request."
+      properties:
+        edit:
+          type: boolean
+        interact:
+          type: boolean
+      required:
+      - edit
+      - interact
+      title: ConsumerCapabilities
+      type: object
+    ConsumerCapabilitiesNotification:
+      description: Notification of the frontend consumer's capabilities.
+      properties:
+        consumer_capabilities:
+          $ref: '#/components/schemas/ConsumerCapabilities'
+        op:
+          enum:
+          - consumer-capabilities
+      required:
+      - op
+      - consumer_capabilities
+      title: ConsumerCapabilitiesNotification
       type: object
     CopyNotebookRequest:
       properties:
@@ -1160,7 +1221,9 @@ components:
     Database:
       description: "Represents a collection of schemas.\n\nAttributes:\n    name (str):\
         \ The name of the database\n    dialect (str): The dialect of the database\n\
-        \    schemas (List[Schema]): List of schemas in the database\n    engine (Optional[VariableName]):\
+        \    schemas (List[Schema]): List of schemas in the database.\n    schemas_resolved\
+        \ (bool): True when `schemas` has been enumerated.\n        False when schema\
+        \ discovery was deferred. Defaults to True\n    engine (Optional[VariableName]):\
         \ Database engine or connection handler, if any."
       properties:
         dialect:
@@ -1176,6 +1239,9 @@ components:
           items:
             $ref: '#/components/schemas/Schema'
           type: array
+        schemas_resolved:
+          default: true
+          type: boolean
       required:
       - name
       - dialect
@@ -1511,13 +1577,22 @@ components:
         \        request: HTTP request context if available.\n        notebook_cells:\
         \ Snapshot of notebook cells from the session document.\n            Used\
         \ to populate the document ContextVar so code_mode can read\n            cell\
-        \ ordering, code, names, and configs.\n        run_id: Optional correlation\
-        \ ID. When set, the\n            ``CompletedRunNotification`` emitted at the\
-        \ end of this command\n            carries the same ``run_id`` so a caller\
-        \ holding a\n            ``ScratchCellListener`` can filter for *its* completion\
-        \ and\n            ignore ``CompletedRun`` events from unrelated commands\
-        \ on the\n            same session."
+        \ ordering, code, names, and configs.\n        cell_outputs: Snapshot of per-cell\
+        \ outputs (main + console) from the\n            session view. Populates a\
+        \ parallel ContextVar so code_mode can\n            expose `cell.output` and\
+        \ `cell.console_outputs`. Frozen at\n            scratchpad start \u2014 not\
+        \ refreshed when `ctx.run_cell` produces\n            new outputs in the same\
+        \ batch.\n        run_id: Optional correlation ID. When set, the\n       \
+        \     `CompletedRunNotification` emitted at the end of this command\n    \
+        \        carries the same `run_id` so a caller holding a\n            `ScratchCellListener`\
+        \ can filter for *its* completion and\n            ignore `CompletedRun` events\
+        \ from unrelated commands on the\n            same session."
       properties:
+        cellOutputs:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CellOutputs'
+          default: null
         code:
           type: string
         notebookCells:
@@ -1547,6 +1622,11 @@ components:
       type: object
     ExecuteScratchpadRequest:
       properties:
+        cellOutputs:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CellOutputs'
+          default: null
         code:
           type: string
         notebookCells:
@@ -1692,9 +1772,9 @@ components:
     FileCreateMultipartRequest:
       description: "multipart/form-data body for POST /api/files/create.\n\n    Schema-only:\
         \ this struct exists to describe the multipart shape in\n    OpenAPI. At runtime,\
-        \ the endpoint reads the string fields from\n    ``MultipartRequest.body``\
-        \ and the uploaded bytes from\n    ``MultipartRequest.files[\"file\"]`` \u2014\
-        \ ``body.file`` is never populated."
+        \ the endpoint reads the string fields from\n    `MultipartRequest.body` and\
+        \ the uploaded bytes from\n    `MultipartRequest.files[\"file\"]` \u2014 `body.file`\
+        \ is never populated."
       properties:
         file:
           anyOf:
@@ -2036,8 +2116,15 @@ components:
       description: "Result of a frontend-initiated function call.\n\n    Attributes:\n\
         \        function_call_id: ID matching the original request.\n        return_value:\
         \ Function return value as JSON.\n        status: Human-readable success/failure\
-        \ status."
+        \ status.\n        found: Whether the requested function was located in the\
+        \ registry.\n            False signals a transient registry desync, so the\
+        \ request is safe\n            to retry. True means no retry will help: a\
+        \ non-ok status then\n            reflects a failure unrelated to lookup,\
+        \ such as the function\n            raising during execution or not being\
+        \ associated with a cell."
       properties:
+        found:
+          type: boolean
         function_call_id:
           $ref: '#/components/schemas/RequestId'
         op:
@@ -2051,6 +2138,7 @@ components:
       - function_call_id
       - return_value
       - status
+      - found
       title: FunctionCallResultNotification
       type: object
     GetCacheInfoCommand:
@@ -2437,6 +2525,8 @@ components:
           items:
             $ref: '#/components/schemas/CellConfig'
           type: array
+        consumer_capabilities:
+          $ref: '#/components/schemas/ConsumerCapabilities'
         kiosk:
           type: boolean
         last_executed_code:
@@ -2482,6 +2572,7 @@ components:
       - app_config
       - kiosk
       - capabilities
+      - consumer_capabilities
       title: KernelReadyNotification
       type: object
     KernelStartupErrorNotification:
@@ -2497,6 +2588,17 @@ components:
       - op
       - error
       title: KernelStartupErrorNotification
+      type: object
+    KernelStatusResponse:
+      properties:
+        state:
+          enum:
+          - idle
+          - running
+          - stopped
+      required:
+      - state
+      title: KernelStatusResponse
       type: object
     KeymapConfig:
       description: "Configuration for keymaps.\n\n    **Keys.**\n\n    - `preset`:\
@@ -2667,6 +2769,7 @@ components:
           - $ref: '#/components/schemas/CacheInfoNotification'
           - $ref: '#/components/schemas/FocusCellNotification'
           - $ref: '#/components/schemas/NotebookDocumentTransactionNotification'
+          - $ref: '#/components/schemas/ConsumerCapabilitiesNotification'
           discriminator:
             mapping:
               alert: '#/components/schemas/AlertNotification'
@@ -2676,6 +2779,7 @@ components:
               cell-op: '#/components/schemas/CellNotification'
               completed-run: '#/components/schemas/CompletedRunNotification'
               completion-result: '#/components/schemas/CompletionResultNotification'
+              consumer-capabilities: '#/components/schemas/ConsumerCapabilitiesNotification'
               data-column-preview: '#/components/schemas/DataColumnPreviewNotification'
               data-source-connections: '#/components/schemas/DataSourceConnectionsNotification'
               datasets: '#/components/schemas/DatasetsNotification'
@@ -2744,11 +2848,11 @@ components:
       type: object
     LintConfig:
       description: "Configuration for lint rule selection.\n\n    Follows ruff-inspired\
-        \ semantics for selecting which rules to run\n    during ``marimo check``.\n\
-        \n    **Keys.**\n\n    - ``select``: list of rule code prefixes that replaces\
-        \ the default\n      enabled set. Use ``\"ALL\"`` to select all rules.\n \
-        \     Example: ``[\"MB\", \"MR001\"]``\n    - ``ignore``: list of rule code\
-        \ prefixes to remove from the\n      enabled set."
+        \ semantics for selecting which rules to run\n    during `marimo check`.\n\
+        \n    **Keys.**\n\n    - `select`: list of rule code prefixes that replaces\
+        \ the default\n      enabled set. Use `\"ALL\"` to select all rules.\n   \
+        \   Example: `[\"MB\", \"MR001\"]`\n    - `ignore`: list of rule code prefixes\
+        \ to remove from the\n      enabled set."
       properties:
         ignore:
           items:
@@ -3580,7 +3684,9 @@ components:
       title: MultipleDefinitionError
       type: object
     NotebookCell:
-      description: "A single cell in the document. Mutable \u2014 owned by the document."
+      description: "A single cell in the document. Mutable \u2014 owned by the document.\n\
+        \n    `version` increments on each `SetCode` that actually changes\n    `code`.\
+        \ Other property changes don't bump it."
       properties:
         code:
           type: string
@@ -3590,6 +3696,9 @@ components:
           $ref: '#/components/schemas/CellId'
         name:
           type: string
+        version:
+          default: 0
+          type: integer
       required:
       - id
       - code
@@ -3701,6 +3810,7 @@ components:
           anyOf:
           - enum:
             - dataflow
+            - external-dependencies
             - fileformat
             - for-jupyter-users
             - intro
@@ -4071,8 +4181,8 @@ components:
       type: object
     ReorderCells:
       description: "Replace the full cell ordering.\n\n    Cell IDs present in the\
-        \ document but missing from ``cell_ids``\n    are appended at the end. IDs\
-        \ not in the document are ignored."
+        \ document but missing from `cell_ids`\n    are appended at the end. IDs not\
+        \ in the document are ignored."
       properties:
         cellIds:
           items:
@@ -4391,6 +4501,11 @@ components:
       title: SaveUserConfigurationRequest
       type: object
     Schema:
+      description: "Represents a database schema and its tables.\n\nAttributes:\n\
+        \    name (str): The name of the schema.\n    tables (List[DataTable]): Tables\
+        \ in this schema.\n    tables_resolved (bool): True when `tables` has been\
+        \ enumerated\n        False when table discovery was deferred. Defaults to\
+        \ True"
       properties:
         name:
           type: string
@@ -4398,6 +4513,9 @@ components:
           items:
             $ref: '#/components/schemas/DataTable'
           type: array
+        tables_resolved:
+          default: true
+          type: boolean
       required:
       - name
       - tables
@@ -4576,9 +4694,12 @@ components:
       description: "Configuration for sharing features.\n\n    **Keys.**\n\n    -\
         \ `html`: if `False`, HTML sharing options will be hidden from the UI\n  \
         \  - `wasm`: if `False`, WebAssembly sharing options will be hidden from the\
-        \ UI"
+        \ UI\n    - `molab`: if `False`, molab sharing options will be hidden from\
+        \ the UI"
       properties:
         html:
+          type: boolean
+        molab:
           type: boolean
         wasm:
           type: boolean
@@ -5080,8 +5201,8 @@ components:
       type: object
     Transaction:
       description: "An atomic batch of changes applied to a NotebookDocument.\n\n\
-        \    ``source`` identifies the writer (e.g. ``\"frontend\"``, ``\"kernel\"\
-        ``).\n    ``version`` is ``None`` when created and stamped by\n    ``NotebookDocument.apply()``."
+        \    `source` identifies the writer (e.g. `\"frontend\"`, `\"kernel\"`).\n\
+        \    `version` is `None` when created and stamped by\n    `NotebookDocument.apply()`."
       properties:
         changes:
           items:
@@ -6719,6 +6840,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
           description: Shutdown the kernel
+  /api/kernel/status:
+    get:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KernelStatusResponse'
+          description: Report whether the kernel is currently executing. `running`
+            means at least one cell is queued or running; `idle` means the kernel
+            is alive but not executing; `stopped` means the kernel process is not
+            running.
   /api/kernel/stdin:
     post:
       parameters:

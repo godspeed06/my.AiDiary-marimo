@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any
 
 from marimo._ast.app import AppKernelRunnerRegistry
 from marimo._config.config import MarimoConfig
-from marimo._messaging.types import Stderr, Stdout
 from marimo._plugins.ui._core.ids import IDProvider, NoIDProviderException
 from marimo._runtime.cell_lifecycle_registry import CellLifecycleRegistry
 from marimo._runtime.context.types import (
@@ -24,7 +23,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from marimo._ast.app import InternalApp
-    from marimo._messaging.types import Stream
+    from marimo._messaging.types import KernelStreams
+    from marimo._runtime.runner.scheduler import Scheduler
     from marimo._runtime.runtime import Kernel
     from marimo._runtime.state import State
     from marimo._runtime.virtual_file import VirtualFileStorageType
@@ -42,6 +42,14 @@ class KernelRuntimeContext(RuntimeContext):
     _app: InternalApp | None = None
     _id_provider: IDProvider | None = None
     _execution_context: ExecutionContext | None = None
+    # Set while a Scheduler's `async with` is open. Lookup goes through
+    # the currently-installed context — not one captured at install
+    # time — so embedded-app child contexts route SIGINT correctly.
+    _active_scheduler: Scheduler | None = None
+
+    @property
+    def active_scheduler(self) -> Scheduler | None:
+        return self._active_scheduler
 
     @property
     def graph(self) -> DirectedGraph:
@@ -141,9 +149,7 @@ class KernelRuntimeContext(RuntimeContext):
 def create_kernel_context(
     *,
     kernel: Kernel,
-    stream: Stream,
-    stdout: Stdout | None,
-    stderr: Stderr | None,
+    streams: KernelStreams,
     virtual_file_storage: VirtualFileStorageType | None,
     mode: SessionMode,
     app: InternalApp | None = None,
@@ -185,9 +191,9 @@ def create_kernel_context(
         ),
         virtual_file_registry=VirtualFileRegistry(storage=storage),
         virtual_files_supported=virtual_file_storage is not None,
-        stream=stream,
-        stdout=stdout,
-        stderr=stderr,
+        stream=streams.stream,
+        stdout=streams.stdout,
+        stderr=streams.stderr,
         children=[],
         parent=parent,
         filename=kernel.app_metadata.filename,
@@ -198,9 +204,7 @@ def create_kernel_context(
 def initialize_kernel_context(
     *,
     kernel: Kernel,
-    stream: Stream,
-    stdout: Stdout | None,
-    stderr: Stderr | None,
+    streams: KernelStreams,
     virtual_file_storage: VirtualFileStorageType | None,
     mode: SessionMode,
 ) -> KernelRuntimeContext:
@@ -210,9 +214,7 @@ def initialize_kernel_context(
     """
     ctx = create_kernel_context(
         kernel=kernel,
-        stream=stream,
-        stdout=stdout,
-        stderr=stderr,
+        streams=streams,
         virtual_file_storage=virtual_file_storage,
         mode=mode,
     )

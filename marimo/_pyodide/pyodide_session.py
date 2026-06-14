@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import re
 import signal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -17,6 +16,7 @@ from marimo._config.config import (
 )
 from marimo._convert.markdown import convert_from_ir_to_markdown
 from marimo._messaging.msgspec_encoder import encode_json_str
+from marimo._messaging.types import KernelStreams
 from marimo._pyodide.restartable_task import RestartableTask
 from marimo._pyodide.streams import (
     PyodideStderr,
@@ -115,6 +115,8 @@ class PyodideSession:
         user_config: MarimoConfig,
     ) -> None:
         """Initialize kernel and client connection to it."""
+        from marimo._runtime.kernel_lifecycle import make_control_enqueuer
+
         self.app_manager = app
         self.mode = mode
         self.app_metadata = app_metadata
@@ -122,6 +124,10 @@ class PyodideSession:
         self.session_consumer = on_write
         self.session_view = SessionView()
         self._initial_user_config = user_config
+        self._enqueue_control_request = make_control_enqueuer(
+            self._queue_manager.control_queue,
+            self._queue_manager.set_ui_element_queue,
+        )
 
         self.consumers: list[Callable[[KernelMessage], None]] = [
             lambda msg: self.session_consumer(msg),
@@ -147,12 +153,7 @@ class PyodideSession:
         await self.kernel_task.start()
 
     def put_control_request(self, request: commands.CommandMessage) -> None:
-        self._queue_manager.control_queue.put_nowait(request)
-        if isinstance(
-            request,
-            (commands.UpdateUIElementCommand, commands.ModelCommand),
-        ):
-            self._queue_manager.set_ui_element_queue.put_nowait(request)
+        self._enqueue_control_request(request)
 
     def put_completion_request(
         self, request: commands.CodeCompletionCommand
@@ -170,46 +171,18 @@ class PyodideSession:
 
         # Prefer dependencies from script metadata
         try:
+            from marimo._runtime.packages.utils import (
+                filter_requirements_for_emscripten,
+                strip_requirement_name,
+            )
+
             reader = PyProjectReader.from_script(code)
-            script_deps = reader.dependencies
-
-            def strip_version(dep: str) -> str:
-                """
-                Strip version specifiers from a dependency string.
-                Handles PEP 440 version specifiers, extras, and URLs.
-                """
-                if not dep or not isinstance(dep, str):
-                    return dep if isinstance(dep, str) else ""
-
-                # Strip whitespace
-                dep = dep.strip()
-                if not dep:
-                    return dep
-
-                # Handle URL dependencies (package @ <url>) - leave as-is
-                # PEP 508 allows various URL schemes: http, https, git+https, git+ssh, file, ftp, etc.
-                if "@" in dep:
-                    _, rhs = dep.split("@", 1)
-                    rhs = rhs.strip()
-                    # Check for URL scheme pattern (e.g., https://, git+https://, file://)
-                    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", rhs):
-                        return dep
-
-                # Handle environment markers (package>=1.0; python_version>='3.8')
-                if ";" in dep:
-                    dep = dep.split(";")[0].strip()
-
-                # Split on PEP 440 version specifiers: ==, !=, <=, >=, <, >, ~=, ===
-                # Must check multi-char operators first to avoid partial matches
-                parts = re.split(
-                    r"\s*(?:===|==|!=|<=|>=|~=|<|>)\s*", dep, maxsplit=1
-                )
-
-                # Return the package name (first part), preserving extras like 'package[extra]'
-                return parts[0].strip() if parts else dep
+            script_deps = filter_requirements_for_emscripten(
+                reader.dependencies
+            )
 
             if len(script_deps) > 0:
-                return [strip_version(dep) for dep in script_deps]
+                return [strip_requirement_name(dep) for dep in script_deps]
         except Exception as e:
             LOGGER.warning("Error parsing script metadata: %s", e)
 
@@ -441,6 +414,7 @@ def _launch_pyodide_kernel(
         KernelArgs,
         asyncio_queue_reader,
         create_kernel,
+        drain_stale,
         listen_messages,
         teardown_kernel,
     )
@@ -464,10 +438,9 @@ def _launch_pyodide_kernel(
 
     kernel, ctx = create_kernel(
         KernelArgs(
-            stream=stream,
-            stdout=stdout,
-            stderr=stderr,
-            stdin=stdin,
+            streams=KernelStreams(
+                stream=stream, stdout=stdout, stderr=stderr, stdin=stdin
+            ),
             debugger=debugger,
             configs=configs,
             app_metadata=app_metadata,
@@ -476,23 +449,17 @@ def _launch_pyodide_kernel(
             control_queue=control_queue,
             set_ui_element_queue=set_ui_element_queue,
             virtual_file_storage=None,
-            print_override_fn=None,
         )
     )
 
     if is_edit_mode:
-        signal.signal(signal.SIGINT, handlers.construct_interrupt_handler(ctx))
+        signal.signal(signal.SIGINT, handlers.construct_interrupt_handler())
 
     async def listen_completion() -> None:
         while True:
-            request = await completion_queue.get()
-            while not completion_queue.empty():
-                # discard stale requests to avoid choking the runtime
-                request = await completion_queue.get()
-            LOGGER.debug("received completion request %s", request)
-            # 5 is arbitrary, but is a good limit:
-            # too high will cause long load times
-            # too low can be not as useful
+            request = drain_stale(
+                completion_queue, latest=await completion_queue.get()
+            )
             kernel.code_completion(request, docstrings_limit=5)
 
     async def listen() -> None:

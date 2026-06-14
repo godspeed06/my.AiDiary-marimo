@@ -33,7 +33,7 @@ app = marimo.App()
 
 
 def _marimo_file(path: str, name: str = "test.py") -> MarimoFile:
-    """Build a ``MarimoFile`` for a real path on disk."""
+    """Build a `MarimoFile` for a real path on disk."""
     return MarimoFile(
         name=name,
         path=path,
@@ -264,7 +264,7 @@ class TestNotebookWorkspace(unittest.TestCase):
         assert exc.value.status_code == HTTPStatus.NOT_FOUND
 
     def test_fixed_files_accepts_dotdot_that_normalizes_to_allowed(self):
-        """Regression test for #8414 — ``..`` paths must normalize correctly."""
+        """Regression test for #8414 — `..` paths must normalize correctly."""
         dotdot_path = os.path.join(
             self.nested_dir, "..", os.path.basename(self.test_file1.name)
         )
@@ -274,7 +274,7 @@ class TestNotebookWorkspace(unittest.TestCase):
         assert os.path.exists(resolved)
 
     def test_fixed_files_new_file_key_is_rejected(self):
-        """``__new__`` keys are not valid in run mode."""
+        """`__new__` keys are not valid in run mode."""
         workspace = FixedFilesWorkspace([])
         with pytest.raises(HTTPException) as exc:
             workspace.resolve(NEW_FILE)
@@ -283,11 +283,11 @@ class TestNotebookWorkspace(unittest.TestCase):
     # ----- security: DirectoryWorkspace -----
 
     def test_directory_workspace_new_file_prefix_does_not_leak(self):
-        """``__new__`` prefix returns None — does not bypass containment.
+        """`__new__` prefix returns None — does not bypass containment.
 
-        ``startswith(NEW_FILE)`` could otherwise be coaxed into accepting
-        crafted keys like ``__new__../etc/passwd``; verify those still resolve
-        to ``None`` (a blank notebook), never an arbitrary file.
+        `startswith(NEW_FILE)` could otherwise be coaxed into accepting
+        crafted keys like `__new__../etc/passwd`; verify those still resolve
+        to `None` (a blank notebook), never an arbitrary file.
         """
         workspace = DirectoryWorkspace(self.test_dir, include_markdown=False)
         for key in (
@@ -298,7 +298,7 @@ class TestNotebookWorkspace(unittest.TestCase):
             assert workspace.resolve(key) is None
 
     def test_directory_workspace_temp_dir_does_not_enable_traversal(self):
-        """A temp-dir bypass must not let attackers escape via ``..``."""
+        """A temp-dir bypass must not let attackers escape via `..`."""
         with (
             tempfile.TemporaryDirectory() as base_dir,
             tempfile.TemporaryDirectory() as temp_dir,
@@ -320,7 +320,7 @@ class TestNotebookWorkspace(unittest.TestCase):
     # ----- security: EmptyWorkspace -----
 
     def test_empty_workspace_load_with_new_file_key_returns_blank(self):
-        """Bare ``__new__`` key always yields an unbacked manager."""
+        """Bare `__new__` key always yields an unbacked manager."""
         workspace = EmptyWorkspace()
         manager = workspace.load(NEW_FILE)
         assert manager.filename is None
@@ -333,7 +333,7 @@ class TestNotebookWorkspace(unittest.TestCase):
         assert exc.value.status_code == HTTPStatus.NOT_FOUND
 
     def test_empty_workspace_resolve_returns_absolute_normalized(self):
-        """``resolve`` must return an absolute, normalized path so downstream
+        """`resolve` must return an absolute, normalized path so downstream
         lookups (session keys, comparisons) don't mismatch between relative
         and absolute spellings of the same file.
         """
@@ -350,12 +350,12 @@ class TestNotebookWorkspace(unittest.TestCase):
             os.chdir(original_cwd)
 
     def test_empty_workspace_load_with_existing_path_falls_back(self):
-        """``marimo new`` boots an EmptyWorkspace; opening a recent file must
+        """`marimo new` boots an EmptyWorkspace; opening a recent file must
         still work via the unconditional existence fallback.
 
         This is intentionally permissive — there's no allowlist, since the
         boot mode has no concept of one. Threat model: anyone able to hit
-        ``marimo new``'s endpoint already has the same trust level as the
+        `marimo new`'s endpoint already has the same trust level as the
         process owner.
         """
         workspace = EmptyWorkspace()

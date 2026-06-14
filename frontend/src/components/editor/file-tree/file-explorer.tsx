@@ -9,7 +9,6 @@ import {
   CopyMinusIcon,
   DownloadIcon,
   ExternalLinkIcon,
-  EyeOffIcon,
   FilePlus2Icon,
   FolderPlusIcon,
   ListTreeIcon,
@@ -42,6 +41,7 @@ import {
   MENU_ITEM_ICON_CLASS,
   RefreshIconButton,
   TreeChevron,
+  VisibilityToggleButton,
 } from "@/components/editor/file-tree/tree-actions";
 import { MarimoIcon, MarimoPlusIcon } from "@/components/icons/marimo-icons";
 import { Spinner } from "@/components/icons/spinner";
@@ -198,6 +198,7 @@ export const FileExplorer: React.FC<{
       <Toolbar
         onRefresh={handleRefresh}
         onHidden={handleHiddenFilesToggle}
+        showHiddenFiles={showHiddenFiles}
         onCreateFile={handleCreateFile}
         onCreateNotebook={handleCreateNotebook}
         onCreateFolder={handleCreateFolder}
@@ -265,6 +266,7 @@ const INDENT_STEP = 15;
 interface ToolbarProps {
   onRefresh: () => void;
   onHidden: () => void;
+  showHiddenFiles: boolean;
   onCreateFile: () => void;
   onCreateNotebook: () => void;
   onCreateFolder: () => void;
@@ -275,6 +277,7 @@ interface ToolbarProps {
 const Toolbar = ({
   onRefresh,
   onHidden,
+  showHiddenFiles,
   onCreateFile,
   onCreateNotebook,
   onCreateFolder,
@@ -334,16 +337,13 @@ const Toolbar = ({
         data-testid="file-explorer-refresh-button"
         onClick={onRefresh}
       />
-      <Tooltip content="Toggle hidden files">
-        <Button
-          data-testid="file-explorer-hidden-files-button"
-          onClick={onHidden}
-          variant="text"
-          size="xs"
-        >
-          <EyeOffIcon size={16} />
-        </Button>
-      </Tooltip>
+      <VisibilityToggleButton
+        data-testid="file-explorer-hidden-files-button"
+        isVisible={showHiddenFiles}
+        onToggle={onHidden}
+        showTooltip="Show hidden files"
+        hideTooltip="Hide hidden files"
+      />
       <Tooltip content="Collapse all folders">
         <Button
           data-testid="file-explorer-collapse-button"

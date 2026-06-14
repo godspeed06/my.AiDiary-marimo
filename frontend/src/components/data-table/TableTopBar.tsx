@@ -1,6 +1,7 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 "use no memo";
 
+import type { Table } from "@tanstack/react-table";
 import { useDebounce } from "@uidotdev/usehooks";
 import {
   ChartSplineIcon,
@@ -17,13 +18,15 @@ import {
 } from "../editor/chrome/panels/context-aware-panel/context-aware-panel";
 import { Spinner } from "../icons/spinner";
 import { Button } from "../ui/button";
+import { ColumnVisibilityDropdown } from "./column-visibility-dropdown";
 import { type ExportActionProps, ExportMenu } from "./export-actions";
 
 const NOOP_ON_SEARCH = () => {
   /** no-op*/
 };
 
-interface TableTopBarProps extends Partial<ExportActionProps> {
+interface TableTopBarProps<TData> extends Partial<ExportActionProps> {
+  table: Table<TData>;
   enableSearch: boolean;
   searchQuery?: string;
   onSearchQueryChange?: (query: string) => void;
@@ -35,9 +38,11 @@ interface TableTopBarProps extends Partial<ExportActionProps> {
   togglePanel?: (panelType: PanelType) => void;
   isAnyPanelOpen?: boolean;
   sizeBytes?: number | null;
+  sizeBytesIsLoading?: boolean;
 }
 
-export const TableTopBar: React.FC<TableTopBarProps> = ({
+export const TableTopBar = <TData,>({
+  table,
   enableSearch,
   searchQuery,
   onSearchQueryChange,
@@ -50,7 +55,8 @@ export const TableTopBar: React.FC<TableTopBarProps> = ({
   isAnyPanelOpen,
   downloadAs,
   sizeBytes,
-}) => {
+  sizeBytesIsLoading,
+}: TableTopBarProps<TData>) => {
   const [internalValue, setInternalValue] = useState(searchQuery || "");
   const debouncedSearch = useDebounce(internalValue, 500);
   const onSearch = useEvent(onSearchQueryChange ?? NOOP_ON_SEARCH);
@@ -59,16 +65,6 @@ export const TableTopBar: React.FC<TableTopBarProps> = ({
   useEffect(() => {
     onSearch(debouncedSearch);
   }, [debouncedSearch, onSearch]);
-
-  const hasAnyAction =
-    (enableSearch && onSearchQueryChange) ||
-    showChartBuilder ||
-    showTableExplorer ||
-    downloadAs;
-
-  if (!hasAnyAction) {
-    return null;
-  }
 
   return (
     <div className="flex items-center h-10 px-2 border-b gap-2">
@@ -104,6 +100,7 @@ export const TableTopBar: React.FC<TableTopBarProps> = ({
       )}
 
       <div className="flex items-center shrink-0">
+        <ColumnVisibilityDropdown table={table} />
         {showChartBuilder && (
           <Button
             variant="text"
@@ -133,7 +130,11 @@ export const TableTopBar: React.FC<TableTopBarProps> = ({
           </Button>
         )}
         {downloadAs && (
-          <ExportMenu downloadAs={downloadAs} sizeBytes={sizeBytes} />
+          <ExportMenu
+            downloadAs={downloadAs}
+            sizeBytes={sizeBytes}
+            sizeBytesIsLoading={sizeBytesIsLoading}
+          />
         )}
       </div>
     </div>

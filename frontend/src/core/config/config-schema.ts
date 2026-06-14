@@ -75,6 +75,7 @@ export const UserConfigSchema = z
       .object({
         activate_on_typing: z.boolean().prefault(true),
         signature_hint_on_typing: z.boolean().prefault(false),
+        auto_close_pairs: z.boolean().prefault(true),
         copilot: z
           .union([z.boolean(), z.enum(["github", "codeium", "custom"])])
           .prefault(false)
@@ -157,7 +158,9 @@ export const UserConfigSchema = z
       .prefault({}),
     ai: z
       .looseObject({
+        enabled: z.boolean().prefault(true),
         rules: z.string().prefault(""),
+        max_tokens: z.number().int().positive().nullable().optional(),
         mode: z.enum(COPILOT_MODES).prefault("manual"),
         inline_tooltip: z.boolean().prefault(false),
         open_ai: AiConfigSchema.optional(),
@@ -207,6 +210,7 @@ export const UserConfigSchema = z
       .looseObject({
         html: z.boolean().optional(),
         wasm: z.boolean().optional(),
+        molab: z.boolean().optional(),
       })
       .optional(),
     mcp: z

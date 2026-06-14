@@ -11,10 +11,8 @@ import type {
   NotificationMessageData,
   NotificationPayload,
 } from "@/core/kernel/messages";
-import {
-  MAX_RETRIES,
-  useConnectionTransport,
-} from "@/core/websocket/useWebSocket";
+import { TRANSPORT_EXHAUSTED_REASON } from "@/core/websocket/transports/ws";
+import { useConnectionTransport } from "@/core/websocket/useWebSocket";
 import { renderHTML } from "@/plugins/core/RenderHTML";
 import {
   handleWidgetMessage,
@@ -80,26 +78,34 @@ import {
 
 const SUPPORTS_LAZY_KERNELS = true;
 
+// All MARIMO_* reasons except TRANSPORT_EXHAUSTED are emitted by the backend
+// (marimo/_server/api/endpoints/ws_endpoint.py and ws/*.py). Keep in sync with
+// the backend literals.
+export type CloseReason =
+  | "MARIMO_WRONG_KERNEL_ID"
+  | "MARIMO_NO_FILE_KEY"
+  | "MARIMO_NO_SESSION_ID"
+  | "MARIMO_NO_SESSION"
+  | "MARIMO_SHUTDOWN"
+  | "MARIMO_MALFORMED_QUERY"
+  | "MARIMO_KERNEL_STARTUP_ERROR"
+  | typeof TRANSPORT_EXHAUSTED_REASON;
+
 export type CloseDecision =
   | { kind: "terminal"; status: ConnectionStatus; closeTransport: boolean }
   | { kind: "gave-up"; status: ConnectionStatus }
   | { kind: "retry"; status: ConnectionStatus };
 
-export function classifyCloseEvent(
-  event: { reason?: string },
-  context: { retryCount: number; maxRetries: number },
-): CloseDecision {
-  switch (event.reason) {
-    case "MARIMO_ALREADY_CONNECTED":
+export function classifyCloseEvent(event: { reason?: string }): CloseDecision {
+  switch (event.reason as CloseReason | undefined) {
+    case TRANSPORT_EXHAUSTED_REASON:
       return {
-        kind: "terminal",
+        kind: "gave-up",
         status: {
           state: WebSocketState.CLOSED,
-          code: WebSocketClosedReason.ALREADY_RUNNING,
-          reason: "another browser tab is already connected to the kernel",
-          canTakeover: true,
+          code: WebSocketClosedReason.KERNEL_DISCONNECTED,
+          reason: "kernel not found",
         },
-        closeTransport: true,
       };
     case "MARIMO_WRONG_KERNEL_ID":
     case "MARIMO_NO_FILE_KEY":
@@ -144,18 +150,7 @@ export function classifyCloseEvent(
         logNever(event.reason as never);
       }
   }
-  // partysocket stops retrying silently once `maxRetries` is hit; surface
-  // CLOSED so callers can detect the give-up.
-  if (context.retryCount >= context.maxRetries) {
-    return {
-      kind: "gave-up",
-      status: {
-        state: WebSocketState.CLOSED,
-        code: WebSocketClosedReason.KERNEL_DISCONNECTED,
-        reason: "kernel not found",
-      },
-    };
-  }
+
   return {
     kind: "retry",
     status: { state: WebSocketState.CONNECTING },
@@ -414,6 +409,9 @@ export function useMarimoKernelConnection(opts: {
       case "notebook-document-transaction":
         handleDocumentTransaction(msg.data.transaction);
         return;
+      case "consumer-capabilities":
+        setKioskMode(!msg.data.consumer_capabilities.edit);
+        return;
       default:
         logNever(msg.data);
     }
@@ -440,7 +438,7 @@ export function useMarimoKernelConnection(opts: {
     }
     shouldTryReconnecting.current = true;
     setConnection({ state: WebSocketState.CONNECTING });
-    const healthy = await runtimeManager.isHealthy();
+    const healthy = await runtimeManager.reconcileFromHealth();
     if (!healthy) {
       shouldTryReconnecting.current = false;
       setConnection({
@@ -512,10 +510,7 @@ export function useMarimoKernelConnection(opts: {
      */
     onClose: (e) => {
       Logger.warn("WebSocket closed", e.code, e.reason);
-      const decision = classifyCloseEvent(e, {
-        retryCount: ws.retryCount,
-        maxRetries: MAX_RETRIES,
-      });
+      const decision = classifyCloseEvent(e);
       setConnection(decision.status);
       if (decision.kind === "terminal" && decision.closeTransport) {
         ws.close(); // close to prevent reconnecting

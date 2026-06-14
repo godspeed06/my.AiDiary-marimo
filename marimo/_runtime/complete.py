@@ -5,7 +5,6 @@ import ast
 import html
 import re
 import sys
-import threading
 import time
 from collections.abc import Collection, Mapping
 from functools import lru_cache
@@ -23,7 +22,6 @@ from marimo._messaging.types import Stream
 from marimo._output.md import _md
 from marimo._runtime import dataflow
 from marimo._runtime.commands import CodeCompletionCommand
-from marimo._session.queue import QueueType
 from marimo._types.ids import RequestId
 from marimo._utils.docs import MarimoConverter
 from marimo._utils.format_signature import format_signature
@@ -259,19 +257,48 @@ def _get_type_hint(completion: jedi.api.classes.BaseName) -> str:
         return ""
 
 
+# Jedi types that carry a signature/docstring worth surfacing in live docs.
+_DOCUMENTABLE_TYPES = ("function", "class", "module")
+
+
+def _resolve_aliased_definition(
+    completion: jedi.api.classes.BaseName,
+) -> jedi.api.classes.BaseName | None:
+    """Follow an assignment statement to its underlying definition.
+
+    Aliases such as `func = another_func` are reported by Jedi as a `statement`
+    with no docstring of their own, so we infer the assignment to surface the
+    docstring and signature of the function/class/module it points at.
+
+    Only an unambiguous, single definition is resolved; multiple candidates
+    (e.g. a conditional assignment) would mean guessing which docs to show, so
+    we defer to the type hint instead.
+    """
+    try:
+        inferred = completion.infer()
+    except Exception:
+        return None
+    documentable = [d for d in inferred if d.type in _DOCUMENTABLE_TYPES]
+    if len(documentable) == 1:
+        return documentable[0]
+    return None
+
+
 def _get_completion_info(completion: jedi.api.classes.BaseName) -> str:
-    if completion.type != "statement":
-        try:
-            return _get_docstring(completion)
-        except Exception as e:
-            LOGGER.debug("jedi failed to get docstring: %s", str(e))
-            return ""
-    else:
-        try:
+    try:
+        if completion.type == "statement":
+            definition = _resolve_aliased_definition(completion)
+            # Fall back to the type hint when the alias has no resolvable
+            # definition, or when its docstring comes back empty.
+            if definition is not None:
+                docstring = _get_docstring(definition)
+                if docstring:
+                    return docstring
             return _get_type_hint(completion)
-        except Exception as e:
-            LOGGER.debug("jedi failed to get type hint: %s", str(e))
-            return ""
+        return _get_docstring(completion)
+    except Exception as e:
+        LOGGER.debug("jedi failed to get completion info: %s", str(e))
+        return ""
 
 
 def _get_completion_option(
@@ -360,17 +387,6 @@ def _write_no_completions(stream: Stream, completion_id: RequestId) -> None:
     _write_completion_result(stream, completion_id, 0, [])
 
 
-def _drain_queue(
-    completion_queue: QueueType[CodeCompletionCommand],
-) -> CodeCompletionCommand:
-    """Drain the queue of completion requests, returning the most recent one"""
-
-    request = completion_queue.get()
-    while not completion_queue.empty():
-        request = completion_queue.get()
-    return request
-
-
 def _get_completions_with_script(
     codes: list[str], document: str
 ) -> tuple[jedi.Script, list[jedi.api.classes.Completion]]:
@@ -435,7 +451,7 @@ def _key_options_from_ipython_method(obj: Any) -> list[str]:
 
 
 def _key_options_via_keys_method(obj: Mapping[Any, Any]) -> list[str]:
-    """Completion keys from a mapping. Only used after ``isinstance(obj, Mapping)``."""
+    """Completion keys from a mapping. Only used after `isinstance(obj, Mapping)`."""
     return [str(key) for key in obj]
 
 
@@ -739,32 +755,3 @@ def complete(
             pass
         else:
             LOGGER.debug("Completion worker released globals lock.")
-
-
-def completion_worker(
-    completion_queue: QueueType[CodeCompletionCommand],
-    graph: dataflow.DirectedGraph,
-    glbls: dict[str, Any],
-    glbls_lock: threading.RLock,
-    stream: Stream,
-) -> None:
-    """Code completion worker.
-
-
-    Args:
-        completion_queue: queue from which requests are pulled.
-        graph: dataflow graph backing the marimo program
-        glbls: dictionary of global variables in interpreter memory
-        glbls_lock: lock protecting globals
-        stream: stream used to communicate completion results
-    """
-
-    while True:
-        request = _drain_queue(completion_queue)
-        complete(
-            request=request,
-            graph=graph,
-            glbls=glbls,
-            glbls_lock=glbls_lock,
-            stream=stream,
-        )

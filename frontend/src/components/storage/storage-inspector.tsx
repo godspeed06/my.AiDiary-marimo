@@ -95,14 +95,30 @@ function displayName(path: string): string {
 }
 
 /**
+ * Stable, unique identity for an entry row. Prefer the
+ * backend's stable id when present and fall back to the list index
+ */
+export function storageEntryKey(entry: StorageEntry, index: number): string {
+  const id = entry.metadata?.id;
+  if (typeof id === "string" && id.length > 0) {
+    return id;
+  }
+  return `${entry.path}::${index}`;
+}
+
+interface SearchContext {
+  namespace: string;
+  searchValue: string;
+  entriesByPath: ReadonlyMap<StoragePathKey, StorageEntry[]>;
+}
+
+/**
  * Recursively check whether an entry (or any of its loaded descendants)
  * matches the search query.
  */
 function entryMatchesSearch(
   entry: StorageEntry,
-  namespace: string,
-  searchValue: string,
-  entriesByPath: ReadonlyMap<StoragePathKey, StorageEntry[]>,
+  { namespace, searchValue, entriesByPath }: SearchContext,
 ): boolean {
   const query = searchValue.toLowerCase();
 
@@ -115,7 +131,7 @@ function entryMatchesSearch(
     const children = entriesByPath.get(storagePathKey(namespace, entry.path));
     if (children) {
       return children.some((child) =>
-        entryMatchesSearch(child, namespace, searchValue, entriesByPath),
+        entryMatchesSearch(child, { namespace, searchValue, entriesByPath }),
       );
     }
   }
@@ -129,16 +145,12 @@ function entryMatchesSearch(
  */
 function filterEntries(
   entries: StorageEntry[],
-  namespace: string,
-  searchValue: string,
-  entriesByPath: ReadonlyMap<StoragePathKey, StorageEntry[]>,
+  context: SearchContext,
 ): StorageEntry[] {
-  if (!searchValue.trim()) {
+  if (!context.searchValue.trim()) {
     return entries;
   }
-  return entries.filter((entry) =>
-    entryMatchesSearch(entry, namespace, searchValue, entriesByPath),
-  );
+  return entries.filter((entry) => entryMatchesSearch(entry, context));
 }
 
 /**
@@ -204,35 +216,39 @@ const StorageEntryChildren: React.FC<{
     );
   }
 
-  const filtered = filterEntries(
-    children,
+  const filtered = filterEntries(children, {
     namespace,
     searchValue,
     entriesByPath,
-  );
+  });
 
   return (
     <>
-      {filtered.map((child) => (
-        <StorageEntryRow
-          key={child.path}
-          entry={child}
-          namespace={namespace}
-          protocol={protocol}
-          rootPath={rootPath}
-          backendType={backendType}
-          depth={depth}
-          locale={locale}
-          searchValue={searchValue}
-          onOpenFile={onOpenFile}
-        />
-      ))}
+      {filtered.map((child) => {
+        const rowKey = storageEntryKey(child, children.indexOf(child));
+        return (
+          <StorageEntryRow
+            key={rowKey}
+            rowKey={rowKey}
+            entry={child}
+            namespace={namespace}
+            protocol={protocol}
+            rootPath={rootPath}
+            backendType={backendType}
+            depth={depth}
+            locale={locale}
+            searchValue={searchValue}
+            onOpenFile={onOpenFile}
+          />
+        );
+      })}
     </>
   );
 };
 
 const StorageEntryRow: React.FC<{
   entry: StorageEntry;
+  rowKey: string;
   namespace: string;
   protocol: string;
   rootPath: string;
@@ -243,6 +259,7 @@ const StorageEntryRow: React.FC<{
   onOpenFile: (info: OpenFileInfo) => void;
 }> = ({
   entry,
+  rowKey,
   namespace,
   protocol,
   rootPath,
@@ -271,7 +288,7 @@ const StorageEntryRow: React.FC<{
     !!entriesByPath
       .get(storagePathKey(namespace, entry.path))
       ?.some((child) =>
-        entryMatchesSearch(child, namespace, searchValue, entriesByPath),
+        entryMatchesSearch(child, { namespace, searchValue, entriesByPath }),
       );
 
   // Folder is shown expanded by manual toggle OR by search auto-expand
@@ -312,7 +329,7 @@ const StorageEntryRow: React.FC<{
           isDir && "font-medium",
         )}
         style={indentStyle(depth)}
-        value={`${namespace}:${entry.path}`}
+        value={`${namespace}:${rowKey}`}
         onSelect={() => {
           if (isDir) {
             setIsExpanded(!effectiveExpanded);
@@ -458,12 +475,11 @@ const StorageNamespaceSection: React.FC<{
 
   // While loading, fall back to initial entries from the namespace notification
   const entries = isPending ? namespace.storageEntries : fetchedEntries;
-  const filtered = filterEntries(
-    entries,
-    namespaceName,
+  const filtered = filterEntries(entries, {
+    namespace: namespaceName,
     searchValue,
     entriesByPath,
-  );
+  });
 
   return (
     <>
@@ -525,20 +541,24 @@ const StorageNamespaceSection: React.FC<{
               No matches
             </div>
           )}
-          {filtered.map((entry) => (
-            <StorageEntryRow
-              key={entry.path}
-              entry={entry}
-              namespace={namespaceName}
-              protocol={namespace.protocol}
-              rootPath={namespace.rootPath}
-              backendType={namespace.backendType}
-              depth={1}
-              locale={locale}
-              searchValue={searchValue}
-              onOpenFile={onOpenFile}
-            />
-          ))}
+          {filtered.map((entry) => {
+            const rowKey = storageEntryKey(entry, entries.indexOf(entry));
+            return (
+              <StorageEntryRow
+                key={rowKey}
+                rowKey={rowKey}
+                entry={entry}
+                namespace={namespaceName}
+                protocol={namespace.protocol}
+                rootPath={namespace.rootPath}
+                backendType={namespace.backendType}
+                depth={1}
+                locale={locale}
+                searchValue={searchValue}
+                onOpenFile={onOpenFile}
+              />
+            );
+          })}
         </>
       )}
     </>

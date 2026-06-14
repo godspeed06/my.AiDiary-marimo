@@ -9,6 +9,7 @@ import { Events } from "@/utils/events";
 import { prettyNumber } from "@/utils/numbers";
 import { Button } from "../ui/button";
 import { toast } from "../ui/use-toast";
+import { getColumnCountForDisplay } from "./hooks/use-column-visibility";
 import { DataTablePagination, prettifyRowColumnCount } from "./pagination";
 import { CellSelectionStats } from "./range-focus/cell-selection-stats";
 import type { DataTableSelection } from "./types";
@@ -140,13 +141,19 @@ export const TableBottomBar = <TData,>({
       );
     }
 
+    const { totalColumns: effectiveTotalColumns, hiddenColumns } =
+      getColumnCountForDisplay(table, totalColumns);
+    const { rowsAndColumns, hiddenSuffix } = prettifyRowColumnCount({
+      numRows: table.getRowCount(),
+      totalColumns: effectiveTotalColumns,
+      hiddenColumns,
+      locale,
+    });
+
     return (
-      <span>
-        {prettifyRowColumnCount({
-          numRows: table.getRowCount(),
-          totalColumns,
-          locale,
-        })}
+      <span className="flex items-center gap-1">
+        <span>{rowsAndColumns}</span>
+        {hiddenSuffix && <span className="text-xs">{hiddenSuffix}</span>}
       </span>
     );
   };

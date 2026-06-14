@@ -10,6 +10,7 @@ import {
   PanelRightOpenIcon,
   KeyboardIcon,
 } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   Select,
@@ -26,15 +27,23 @@ import type {
   SlidesLayout,
   SlideType,
 } from "../editor/renderers/slides-layout/types";
-import { useState } from "react";
+import { useAtom } from "jotai";
+import { atomWithStorage } from "jotai/utils";
 import { Tooltip } from "../ui/tooltip";
 import { Button } from "../ui/button";
 import { Kbd } from "../ui/kbd";
 import type { RuntimeCell } from "@/core/cells/types";
+import { jotaiJsonStorage } from "@/utils/storage/jotai";
 
 export const DEFAULT_SLIDE_TYPE: SlideType = "slide";
 export const DEFAULT_DECK_TRANSITION: DeckTransition = "slide";
 const COLLAPSED_CONFIG_WIDTH = 36;
+const slideConfigOpenAtom = atomWithStorage<boolean>(
+  "marimo:slides:config-open",
+  true,
+  jotaiJsonStorage,
+  { getOnInit: true },
+);
 
 export interface SlideTypeOption {
   value: SlideType;
@@ -188,13 +197,22 @@ const SlideConfigForm = ({
   setLayout: (layout: SlidesLayout) => void;
   cellId: CellId;
 }) => {
-  const currentSlideType: SlideType =
-    layout.cells.get(cellId)?.type ?? DEFAULT_SLIDE_TYPE;
+  const currentConfig = layout.cells.get(cellId);
+  const currentSlideType: SlideType = currentConfig?.type ?? DEFAULT_SLIDE_TYPE;
+  const showCode = currentConfig?.showCode ?? false;
 
   const handleSlideTypeChange = (value: SlideType) => {
-    const existingConfig = layout.cells.get(cellId);
     const newCells = new Map(layout.cells);
-    newCells.set(cellId, { ...existingConfig, type: value });
+    newCells.set(cellId, { ...currentConfig, type: value });
+    setLayout({
+      ...layout,
+      cells: newCells,
+    });
+  };
+
+  const handleShowCodeChange = (checked: boolean) => {
+    const newCells = new Map(layout.cells);
+    newCells.set(cellId, { ...currentConfig, showCode: checked });
     setLayout({
       ...layout,
       cells: newCells,
@@ -253,6 +271,18 @@ const SlideConfigForm = ({
           );
         })}
       </RadioGroup>
+      <div className="flex items-center gap-2">
+        <label htmlFor="slide-show-code" className="text-sm">
+          Show code
+        </label>
+        <Switch
+          id="slide-show-code"
+          aria-label="Show code"
+          checked={showCode}
+          onCheckedChange={handleShowCodeChange}
+          size="sm"
+        />
+      </div>
     </div>
   );
 };
@@ -322,7 +352,7 @@ export const SlideSidebar = ({
   setLayout: (layout: SlidesLayout) => void;
   activeConfigCell?: RuntimeCell;
 }) => {
-  const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const [isConfigOpen, setIsConfigOpen] = useAtom(slideConfigOpenAtom);
 
   return (
     <aside
@@ -350,7 +380,7 @@ export const SlideSidebar = ({
             variant="ghost"
             size="icon"
             className="h-7 w-7 text-muted-foreground hover:text-foreground"
-            onClick={() => setIsConfigOpen(!isConfigOpen)}
+            onClick={() => setIsConfigOpen((open) => !open)}
             aria-expanded={isConfigOpen}
             aria-controls="slide-config-panel"
           >

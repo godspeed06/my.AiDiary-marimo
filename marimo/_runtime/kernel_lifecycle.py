@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import queue as _queue
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from marimo import _loggers
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 
     from marimo._ast.cell import CellConfig
     from marimo._config.config import MarimoConfig
-    from marimo._messaging.types import Stderr, Stdin, Stdout, Stream
+    from marimo._messaging.types import KernelStreams
     from marimo._runtime import marimo_pdb
     from marimo._runtime.commands import (
         AppMetadata,
@@ -62,10 +63,7 @@ if TYPE_CHECKING:
 class KernelArgs:
     """All inputs needed to construct a `Kernel` and its runtime context."""
 
-    stream: Stream
-    stdout: Stdout | None
-    stderr: Stderr | None
-    stdin: Stdin | None
+    streams: KernelStreams
     debugger: marimo_pdb.MarimoPdb | None
     configs: dict[CellId_t, CellConfig]
     app_metadata: AppMetadata
@@ -74,7 +72,6 @@ class KernelArgs:
     control_queue: ControlQueue
     set_ui_element_queue: UIElementQueue
     virtual_file_storage: VirtualFileStorageType | None
-    print_override_fn: Callable[[Any], None] | None
 
     @property
     def is_edit_mode(self) -> bool:
@@ -86,6 +83,20 @@ LOGGER = _loggers.marimo_logger()
 # Lets each caller pin listen_messages and its reader to the same queue type
 # (threading vs asyncio).
 _Q = TypeVar("_Q")
+_T = TypeVar("_T")
+
+
+def drain_stale(queue: Any, *, latest: _T) -> _T:
+    """Discard stale items queued behind `latest` and return the newest.
+
+    Drains via `get_nowait()` until exhausted; `empty()` is intentionally
+    avoided because `multiprocessing.Queue.empty()` can lie.
+    """
+    while True:
+        try:
+            latest = queue.get_nowait()
+        except (asyncio.QueueEmpty, _queue.Empty):
+            return latest
 
 
 def _build_hooks(
@@ -106,6 +117,21 @@ def _build_hooks(
     return hooks
 
 
+def make_control_enqueuer(
+    control_queue: ControlQueue,
+    set_ui_element_queue: UIElementQueue,
+) -> Callable[[CommandMessage], None]:
+    """Build a callable that routes control requests, mirroring UI-element
+    commands onto the batching queue."""
+
+    def enqueue(req: CommandMessage) -> None:
+        control_queue.put_nowait(req)
+        if isinstance(req, (UpdateUIElementCommand, ModelCommand)):
+            set_ui_element_queue.put_nowait(req)
+
+    return enqueue
+
+
 def create_kernel(
     args: KernelArgs,
 ) -> tuple[Kernel, KernelRuntimeContext]:
@@ -116,37 +142,29 @@ def create_kernel(
         user_config["runtime"]["on_cell_change"] = "autorun"
         user_config["runtime"]["auto_reload"] = "off"
 
-    def _enqueue_control_request(req: CommandMessage) -> None:
-        args.control_queue.put_nowait(req)
-        if isinstance(req, (UpdateUIElementCommand, ModelCommand)):
-            args.set_ui_element_queue.put_nowait(req)
-
     # Deferred to break the runtime.py <-> kernel_lifecycle.py import cycle.
     from marimo._runtime.runtime import Kernel
 
     kernel = Kernel(
         cell_configs=args.configs,
         app_metadata=args.app_metadata,
-        stream=args.stream,
-        stdout=args.stdout,
-        stderr=args.stderr,
-        stdin=args.stdin,
+        streams=args.streams,
         module=patches.patch_main_module(
             file=args.app_metadata.filename,
             input_override=input_override,
-            print_override=args.print_override_fn,
             doc=args.app_metadata.docstring,
         ),
         debugger_override=args.debugger,
         user_config=user_config,
-        enqueue_control_request=_enqueue_control_request,
+        enqueue_control_request=make_control_enqueuer(
+            args.control_queue,
+            args.set_ui_element_queue,
+        ),
         hooks=_build_hooks(args.is_edit_mode, user_config),
     )
     ctx = initialize_kernel_context(
         kernel=kernel,
-        stream=args.stream,
-        stdout=args.stdout,
-        stderr=args.stderr,
+        streams=args.streams,
         virtual_file_storage=args.virtual_file_storage,
         mode=args.mode,
     )

@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+import msgspec
+
 from marimo import _loggers
 from marimo._data.models import DataSourceConnection, DataTable
 from marimo._messaging.cell_output import CellChannel, CellOutput
@@ -64,7 +66,7 @@ class ModelReplayState:
 
     Internally uses a dict for buffers (path → bytes) so merging
     updates is a simple dict operation. Converted back to the wire
-    format (parallel lists) on replay via ``to_notification()``.
+    format (parallel lists) on replay via `to_notification()`.
     """
 
     model_id: WidgetModelId
@@ -656,5 +658,11 @@ def merge_cell_notification(
 
     if current.output is None:
         current.output = previous.output
+
+    # UNSET means "unchanged" — inherit the previously broadcast hint so a
+    # reconnect snapshot keeps the reusability badge. None (explicit clear) and
+    # concrete values are left as-is.
+    if current.serialization is msgspec.UNSET:
+        current.serialization = previous.serialization
 
     return current

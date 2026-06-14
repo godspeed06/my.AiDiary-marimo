@@ -2524,6 +2524,43 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/kernel/status": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: {
+      parameters: {
+        query?: never;
+        header: {
+          "Marimo-Session-Id": string;
+        };
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Report whether the kernel is currently executing. `running` means at least one cell is queued or running; `idle` means the kernel is alive but not executing; `stopped` means the kernel process is not running. */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            "application/json": components["schemas"]["KernelStatusResponse"];
+          };
+        };
+      };
+    };
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/kernel/stdin": {
     parameters: {
       query?: never;
@@ -3394,6 +3431,7 @@ export interface components {
      *
      *         **Keys.**
      *
+     *         - `enabled`: if `False`, hide AI actions and panels in the marimo UI
      *         - `rules`: custom rules to include in all AI completion prompts
      *         - `max_tokens`: the maximum number of tokens to use in AI completions
      *         - `mode`: the mode to use for AI completions. Can be one of: `"ask"` or `"manual"`
@@ -3419,6 +3457,7 @@ export interface components {
       custom_providers?: {
         [key: string]: components["schemas"]["OpenAiConfig"];
       };
+      enabled?: boolean;
       github?: components["schemas"]["GitHubConfig"];
       google?: components["schemas"]["GoogleAiConfig"];
       inline_tooltip?: boolean;
@@ -3608,8 +3647,10 @@ export interface components {
      * CellNotification
      * @description Updates a cell's state in the frontend.
      *
-     *         Only fields that are set (not None) will update the cell state.
-     *         Omitting a field leaves that aspect unchanged.
+     *         This is a partial update: each field carries its own "unchanged" semantics,
+     *         documented per field below. Most fields treat None as "unchanged"; fields
+     *         that need to distinguish "unchanged" from "clear" use msgspec.UNSET for the
+     *         former and None for the latter.
      *
      *         Attributes:
      *             cell_id: Unique identifier of the cell being updated.
@@ -3618,7 +3659,7 @@ export interface components {
      *             status: Execution status (idle/running/stale/queued/disabled-transitively).
      *             stale_inputs: Whether cell has stale inputs from changed dependencies.
      *             run_id: Execution run ID for tracing. Auto-set from context.
-     *             serialization: Serialization status (TopLevelHints).
+     *             serialization: Top-level reusability hint. UNSET unchanged, None clears, str sets.
      *             timestamp: Creation timestamp, auto-set.
      */
     CellNotification: {
@@ -3634,7 +3675,6 @@ export interface components {
       output?: null | components["schemas"]["CellOutput"];
       /** @default null */
       run_id?: string | null;
-      /** @default null */
       serialization?: string | null;
       /** @default null */
       stale_inputs?: boolean | null;
@@ -3690,6 +3730,24 @@ export interface components {
         | "video/mp4"
         | "video/mpeg";
       timestamp?: number;
+    };
+    /**
+     * CellOutputs
+     * @description Per-cell output snapshot delivered alongside the document snapshot.
+     *
+     *         `output` carries the cell's last main (rich display) output;
+     *         `console_outputs` carries the buffered stdout/stderr stream from
+     *         its last execution.  Both are keyed by cell id; missing keys mean
+     *         "no output captured" (the cell never ran, or produced nothing on
+     *         that channel).
+     */
+    CellOutputs: {
+      console_outputs: {
+        [key: string]: components["schemas"]["CellOutput"][];
+      };
+      output: {
+        [key: string]: components["schemas"]["CellOutput"];
+      };
     };
     /** ChatAttachment */
     ChatAttachment: {
@@ -3810,8 +3868,8 @@ export interface components {
      *
      *         Attributes:
      *             run_id: Correlation ID echoed from the command that triggered
-     *                 this completion. ``None`` for handlers that don't take a
-     *                 ``run_id`` (everything except ``handle_execute_scratchpad``
+     *                 this completion. `None` for handlers that don't take a
+     *                 `run_id` (everything except `handle_execute_scratchpad`
      *                 today). Consumers that want to wait for a specific command's
      *                 completion filter on this field.
      */
@@ -3835,10 +3893,13 @@ export interface components {
      *         - `signature_hint_on_typing`: if `False`, signature hint won't be shown when typing
      *         - `copilot`: one of `"github"`, `"codeium"`, or `"custom"`
      *         - `codeium_api_key`: the Codeium API key
+     *         - `auto_close_pairs`: if `False`, typing an opening bracket, parenthesis,
+     *         or quote will not automatically insert the closing character
      */
     CompletionConfig: {
       activate_on_typing: boolean;
       api_key?: string | null;
+      auto_close_pairs?: boolean;
       base_url?: string | null;
       codeium_api_key?: string | null;
       copilot: boolean | ("codeium" | "custom" | "github");
@@ -3866,6 +3927,32 @@ export interface components {
       op: "completion-result";
       options: components["schemas"]["CompletionOption"][];
       prefix_length: number;
+    };
+    /**
+     * ConsumerCapabilities
+     * @description Per-consumer access capabilities for a session connection.
+     *
+     *         - editor: `{edit: True, interact: True}`
+     *         - viewer: `{edit: False, interact: False}`
+     *
+     *         These gate the frontend UI; they are not the server's authority boundary.
+     *         Scopes are granted per session mode (see `@requires`), so in an edit session
+     *         every connection (viewers included) carries the `edit` scope and can issue
+     *         edit requests. A viewer's read-only status is enforced by the client hiding
+     *         edit affordances, not by the server rejecting the request.
+     */
+    ConsumerCapabilities: {
+      edit: boolean;
+      interact: boolean;
+    };
+    /**
+     * ConsumerCapabilitiesNotification
+     * @description Notification of the frontend consumer's capabilities.
+     */
+    ConsumerCapabilitiesNotification: {
+      consumer_capabilities: components["schemas"]["ConsumerCapabilities"];
+      /** @enum {unknown} */
+      op: "consumer-capabilities";
     };
     /** CopyNotebookRequest */
     CopyNotebookRequest: {
@@ -4057,7 +4144,9 @@ export interface components {
      *     Attributes:
      *         name (str): The name of the database
      *         dialect (str): The dialect of the database
-     *         schemas (List[Schema]): List of schemas in the database
+     *         schemas (List[Schema]): List of schemas in the database.
+     *         schemas_resolved (bool): True when `schemas` has been enumerated.
+     *             False when schema discovery was deferred. Defaults to True
      *         engine (Optional[VariableName]): Database engine or connection handler, if any.
      */
     Database: {
@@ -4066,6 +4155,8 @@ export interface components {
       engine?: components["schemas"]["VariableName"] | null;
       name: string;
       schemas: components["schemas"]["Schema"][];
+      /** @default true */
+      schemas_resolved?: boolean;
     };
     /**
      * DatasetsNotification
@@ -4278,14 +4369,21 @@ export interface components {
      *             notebook_cells: Snapshot of notebook cells from the session document.
      *                 Used to populate the document ContextVar so code_mode can read
      *                 cell ordering, code, names, and configs.
+     *             cell_outputs: Snapshot of per-cell outputs (main + console) from the
+     *                 session view. Populates a parallel ContextVar so code_mode can
+     *                 expose `cell.output` and `cell.console_outputs`. Frozen at
+     *                 scratchpad start — not refreshed when `ctx.run_cell` produces
+     *                 new outputs in the same batch.
      *             run_id: Optional correlation ID. When set, the
-     *                 ``CompletedRunNotification`` emitted at the end of this command
-     *                 carries the same ``run_id`` so a caller holding a
-     *                 ``ScratchCellListener`` can filter for *its* completion and
-     *                 ignore ``CompletedRun`` events from unrelated commands on the
+     *                 `CompletedRunNotification` emitted at the end of this command
+     *                 carries the same `run_id` so a caller holding a
+     *                 `ScratchCellListener` can filter for *its* completion and
+     *                 ignore `CompletedRun` events from unrelated commands on the
      *                 same session.
      */
     ExecuteScratchpadCommand: {
+      /** @default null */
+      cellOutputs?: null | components["schemas"]["CellOutputs"];
       code: string;
       /** @default null */
       notebookCells?: components["schemas"]["NotebookCell"][] | null;
@@ -4298,6 +4396,8 @@ export interface components {
     };
     /** ExecuteScratchpadRequest */
     ExecuteScratchpadRequest: {
+      /** @default null */
+      cellOutputs?: null | components["schemas"]["CellOutputs"];
       code: string;
       /** @default null */
       notebookCells?: components["schemas"]["NotebookCell"][] | null;
@@ -4381,8 +4481,8 @@ export interface components {
      *
      *         Schema-only: this struct exists to describe the multipart shape in
      *         OpenAPI. At runtime, the endpoint reads the string fields from
-     *         ``MultipartRequest.body`` and the uploaded bytes from
-     *         ``MultipartRequest.files["file"]`` — ``body.file`` is never populated.
+     *         `MultipartRequest.body` and the uploaded bytes from
+     *         `MultipartRequest.files["file"]` — `body.file` is never populated.
      */
     FileCreateMultipartRequest: {
       /**
@@ -4560,8 +4660,14 @@ export interface components {
      *             function_call_id: ID matching the original request.
      *             return_value: Function return value as JSON.
      *             status: Human-readable success/failure status.
+     *             found: Whether the requested function was located in the registry.
+     *                 False signals a transient registry desync, so the request is safe
+     *                 to retry. True means no retry will help: a non-ok status then
+     *                 reflects a failure unrelated to lookup, such as the function
+     *                 raising during execution or not being associated with a cell.
      */
     FunctionCallResultNotification: {
+      found: boolean;
       function_call_id: components["schemas"]["RequestId"];
       /** @enum {unknown} */
       op: "function-call-result";
@@ -4847,6 +4953,7 @@ export interface components {
       cell_ids: components["schemas"]["CellId"][];
       codes: string[];
       configs: components["schemas"]["CellConfig"][];
+      consumer_capabilities: components["schemas"]["ConsumerCapabilities"];
       kiosk: boolean;
       last_executed_code: {
         [key: string]: string;
@@ -4872,6 +4979,11 @@ export interface components {
       error: string;
       /** @enum {unknown} */
       op: "kernel-startup-error";
+    };
+    /** KernelStatusResponse */
+    KernelStatusResponse: {
+      /** @enum {unknown} */
+      state: "idle" | "running" | "stopped";
     };
     /**
      * KeymapConfig
@@ -4986,7 +5098,8 @@ export interface components {
         | components["schemas"]["CacheClearedNotification"]
         | components["schemas"]["CacheInfoNotification"]
         | components["schemas"]["FocusCellNotification"]
-        | components["schemas"]["NotebookDocumentTransactionNotification"];
+        | components["schemas"]["NotebookDocumentTransactionNotification"]
+        | components["schemas"]["ConsumerCapabilitiesNotification"];
     };
     /**
      * LanguageServersConfig
@@ -5015,14 +5128,14 @@ export interface components {
      * @description Configuration for lint rule selection.
      *
      *         Follows ruff-inspired semantics for selecting which rules to run
-     *         during ``marimo check``.
+     *         during `marimo check`.
      *
      *         **Keys.**
      *
-     *         - ``select``: list of rule code prefixes that replaces the default
-     *           enabled set. Use ``"ALL"`` to select all rules.
-     *           Example: ``["MB", "MR001"]``
-     *         - ``ignore``: list of rule code prefixes to remove from the
+     *         - `select`: list of rule code prefixes that replaces the default
+     *           enabled set. Use `"ALL"` to select all rules.
+     *           Example: `["MB", "MR001"]`
+     *         - `ignore`: list of rule code prefixes to remove from the
      *           enabled set.
      */
     LintConfig: {
@@ -5490,12 +5603,17 @@ export interface components {
     /**
      * NotebookCell
      * @description A single cell in the document. Mutable — owned by the document.
+     *
+     *         `version` increments on each `SetCode` that actually changes
+     *         `code`. Other property changes don't bump it.
      */
     NotebookCell: {
       code: string;
       config: components["schemas"]["CellConfig"];
       id: components["schemas"]["CellId"];
       name: string;
+      /** @default 0 */
+      version?: number;
     };
     /**
      * NotebookDocumentTransactionNotification
@@ -5568,6 +5686,7 @@ export interface components {
       tutorialId:
         | (
             | "dataflow"
+            | "external-dependencies"
             | "fileformat"
             | "for-jupyter-users"
             | "intro"
@@ -5818,7 +5937,7 @@ export interface components {
      * ReorderCells
      * @description Replace the full cell ordering.
      *
-     *         Cell IDs present in the document but missing from ``cell_ids``
+     *         Cell IDs present in the document but missing from `cell_ids`
      *         are appended at the end. IDs not in the document are ignored.
      */
     ReorderCells: {
@@ -6028,10 +6147,21 @@ export interface components {
     SaveUserConfigurationRequest: {
       config: Record<string, any>;
     };
-    /** Schema */
+    /**
+     * Schema
+     * @description Represents a database schema and its tables.
+     *
+     *     Attributes:
+     *         name (str): The name of the schema.
+     *         tables (List[DataTable]): Tables in this schema.
+     *         tables_resolved (bool): True when `tables` has been enumerated
+     *             False when table discovery was deferred. Defaults to True
+     */
     Schema: {
       name: string;
       tables: components["schemas"]["DataTable"][];
+      /** @default true */
+      tables_resolved?: boolean;
     };
     /** SchemaColumn */
     SchemaColumn: {
@@ -6131,9 +6261,11 @@ export interface components {
      *
      *         - `html`: if `False`, HTML sharing options will be hidden from the UI
      *         - `wasm`: if `False`, WebAssembly sharing options will be hidden from the UI
+     *         - `molab`: if `False`, molab sharing options will be hidden from the UI
      */
     SharingConfig: {
       html?: boolean;
+      molab?: boolean;
       wasm?: boolean;
     };
     /** ShutdownSessionRequest */
@@ -6455,9 +6587,9 @@ export interface components {
      * Transaction
      * @description An atomic batch of changes applied to a NotebookDocument.
      *
-     *         ``source`` identifies the writer (e.g. ``"frontend"``, ``"kernel"``).
-     *         ``version`` is ``None`` when created and stamped by
-     *         ``NotebookDocument.apply()``.
+     *         `source` identifies the writer (e.g. `"frontend"`, `"kernel"`).
+     *         `version` is `None` when created and stamped by
+     *         `NotebookDocument.apply()`.
      */
     Transaction: {
       changes: (

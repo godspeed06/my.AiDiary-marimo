@@ -1677,6 +1677,71 @@ except NameError:
         # Does not pollute globals, reverts back to 10
         assert k.globals["z"] == 10
 
+    @staticmethod
+    async def test_run_scratch_with_mo_cache_decorator(
+        mocked_kernel: MockedKernel,
+    ) -> None:
+        """Regression test: @mo.cache decoration inside the scratchpad must
+        not raise `KeyError: '__scratch__'`.
+
+        Before the fix that registers SCRATCH_CELL_ID in the kernel's main
+        graph during run_scratchpad, the cache decorator's `_set_context`
+        crashed at `graph.cells[cell_id]` because `__scratch__` lived only
+        in the Runner's local graph, never in `self.graph`.
+        """
+        k = mocked_kernel.k
+        await k.run_scratchpad(
+            "import marimo as mo\n@mo.cache\ndef f(x): return x * 2\nf(3)"
+        )
+        # No KeyError leaked
+        assert not any(
+            "__scratch__" in m for m in mocked_kernel.stderr.messages
+        )
+        # __scratch__ does not linger in the main graph after teardown
+        assert SCRATCH_CELL_ID not in k.graph.cells
+        # Scratchpad does not pollute globals
+        assert "f" not in k.globals
+
+    @staticmethod
+    async def test_run_scratch_with_persistent_cache_context(
+        mocked_kernel: MockedKernel,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """Regression test: `with mo.persistent_cache(...)` in scratchpad
+        must not raise CacheException via the parallel
+        `_cache_context.trace` code path.
+        """
+        k = mocked_kernel.k
+        await k.run_scratchpad(
+            "import marimo as mo\n"
+            "from pathlib import Path\n"
+            f"with mo.persistent_cache('scratch_test', save_path=Path({str(tmp_path)!r})):\n"
+            "    x = sum(range(100))\n"
+            "x"
+        )
+        assert not any(
+            "CacheException" in m or "Could not resolve cell" in m
+            for m in mocked_kernel.stderr.messages
+        )
+        assert SCRATCH_CELL_ID not in k.graph.cells
+
+    @staticmethod
+    async def test_run_scratch_with_mo_cache_cleans_up_after_crash(
+        mocked_kernel: MockedKernel,
+    ) -> None:
+        """Regression test: if the scratchpad raises AFTER decorating,
+        `__scratch__` is still unregistered from the kernel graph (the
+        `try/finally` correctness guard).
+        """
+        k = mocked_kernel.k
+        await k.run_scratchpad(
+            "import marimo as mo\n"
+            "@mo.cache\n"
+            "def f(x): return x * 2\n"
+            "raise RuntimeError('intentional')"
+        )
+        assert SCRATCH_CELL_ID not in k.graph.cells
+
     async def test_rename(
         self, any_kernel: Kernel, exec_req: ExecReqProvider
     ) -> None:
@@ -1773,6 +1838,37 @@ except NameError:
                 assert cell_notification.run_id is None
             else:
                 assert cell_notification.run_id is not None
+
+    async def test_serialization_hint_cleared_only_on_demotion(
+        self, mocked_kernel: MockedKernel, exec_req: ExecReqProvider
+    ) -> None:
+        import msgspec
+
+        k = mocked_kernel.k
+
+        def serialization_hints() -> list[str | None]:
+            stream = MockStream(mocked_kernel.stream)
+            return [
+                cn.serialization
+                for op in stream.operations
+                if op["op"] == "cell-op"
+                for cn in [parse_raw(op, CellNotification)]
+                if cn.serialization is not msgspec.UNSET
+            ]
+
+        # A top-level definition advertises its reusability hint.
+        req = exec_req.get("def foo():\n    return 1")
+        await k.run([req])
+        assert serialization_hints() == ["Valid"]
+
+        # Editing it into a plain assignment clears the hint exactly once
+        # (an explicit None, not an omitted/UNSET field).
+        await k.run([exec_req.get_with_id(req.cell_id, "x = 1")])
+        assert serialization_hints() == ["Valid", None]
+
+        # Re-running the now-ordinary cell emits no further serialization op.
+        await k.run([exec_req.get_with_id(req.cell_id, "x = 2")])
+        assert serialization_hints() == ["Valid", None]
 
     async def test_sync_graph_basic(self, execution_kernel: Kernel) -> None:
         """Test basic synchronization: file changes cell B in A→B→C chain.
@@ -3635,6 +3731,35 @@ class TestErrorHandling:
         assert errors[0].traceback is not None
         assert "ValueError" in errors[0].traceback
 
+    async def test_name_error_includes_suggestion(
+        self, mocked_kernel: MockedKernel, exec_req: ExecReqProvider
+    ) -> None:
+        """A NameError's "Did you mean: ..." suggestion should not be
+        dropped from the error message (regression test)."""
+        k = mocked_kernel.k
+        await k.run(
+            [
+                exec_req.get("aaa = 1"),
+                exec_req.get("print(aa)"),
+            ]
+        )
+        cell_notifications = mocked_kernel.stream.cell_notifications
+        error_cell_notification = _filter_to_error_ops(cell_notifications)
+        assert len(error_cell_notification) == 1
+        errors = _parse_error_output(error_cell_notification[0])
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], MarimoExceptionRaisedError)
+        assert errors[0].exception_type == "NameError"
+        # The base message is stable across all supported Python versions.
+        assert errors[0].msg.startswith("name 'aa' is not defined")
+        # Python 3.13 was the first release where `TracebackException`
+        # exposes the "Did you mean: ..." hint via `format_exception_only`,
+        # which is what the runtime uses to build the message. On 3.10-3.12
+        # the helper degrades to the base message; see test_tracebacks.py.
+        if sys.version_info >= (3, 13):
+            assert "Did you mean: 'aaa'?" in errors[0].msg
+
     async def test_error_handling_in_run_mode_stop(
         self, run_mode_kernel: MockedKernel, exec_req: ExecReqProvider
     ) -> None:
@@ -4065,24 +4190,6 @@ def _filter_to_error_ops(
         if op.output is not None
         and op.output.channel == CellChannel.MARIMO_ERROR
     ]
-
-
-class TestRequestHandler:
-    async def test_request_handler_only_created_once(
-        self, any_kernel: Kernel
-    ) -> None:
-        """Test that request_handler property is only created once."""
-        k = any_kernel
-
-        # Access request_handler multiple times
-        handler1 = k.request_handler
-        handler2 = k.request_handler
-        handler3 = k.request_handler
-
-        # They should all be the same instance
-        assert handler1 is handler2
-        assert handler2 is handler3
-        assert handler1 is handler3
 
 
 class TestLaunchKernelEventLoop:
